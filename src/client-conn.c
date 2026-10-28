@@ -48,6 +48,10 @@ enum {
 
 static guint signals[CLIENT_CONN_LAST_SIGNAL];
 
+gint client_conn_selected_display(void) {
+    return g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0 ? 1 : 0;
+}
+
 G_DEFINE_TYPE(ClientConn, client_conn, G_TYPE_OBJECT);
 
 
@@ -204,7 +208,13 @@ static void channel_new(SpiceSession * s, SpiceChannel * channel, gpointer data)
     }
 
     if (SPICE_IS_DISPLAY_CHANNEL(channel)) {
-        spice_channel_connect(channel);
+        if (id == client_conn_selected_display()) {
+            g_message("Connecting selected display channel %d (%s)", id,
+                      id == 1 ? "full-desktop H.264" : "standard display");
+            spice_channel_connect(channel);
+        } else {
+            g_message("Leaving unselected display channel %d disconnected", id);
+        }
     }
 
     if (SPICE_IS_PLAYBACK_CHANNEL(channel)) {

@@ -1,2 +1,15 @@
 *kdev4
+.build/
+dist/
+logs/
+__pycache__/
+*.pyc
+/src/icon.rc
+/CMakeUserPresets.json
+/server/streaming/spice-fullscreen.default
+/server/nvidia/spice-displays.service
+*.vv
+*.key
+*.pem
+known_hosts
 

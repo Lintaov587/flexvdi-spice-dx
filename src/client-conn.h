@@ -87,6 +87,9 @@ void client_conn_disconnect(ClientConn * conn, ClientConnDisconnectReason reason
  */
 SpiceSession * client_conn_get_session(ClientConn * conn);
 
+/* VM 106: channel 0 is VirtIO, channel 1 is the full-desktop streaming agent. */
+gint client_conn_selected_display(void);
+
 /*
  * client_conn_get_main_channel
  *

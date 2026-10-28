@@ -1,0 +1,16 @@
+[Unit]
+Description=SPICE whole desktop H.264 streaming agent
+Requires=docker.service
+After=docker.service display-manager.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/spice-fullscreen-start.sh
+ExecStop=/usr/bin/docker stop -t 5 spice-fullscreen-h264
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+
+[Install]
+WantedBy=graphical.target

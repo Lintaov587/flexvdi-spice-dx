@@ -1,0 +1,1450 @@
+diff --git a/resources/style.css b/resources/style.css
+index 879e824..e4e6e5c 100644
+--- a/resources/style.css
++++ b/resources/style.css
+@@ -191,3 +191,22 @@ tooltip {
+     border-color: rgba(50,50,50,0.8);
+     font-size: 120%;
+ }
++
++#connection-home { background-color: #ffffff; }
++#connection-home * { font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; font-size: 14px; }
++#connection-home .history-heading { font-size: 28px; font-weight: bold; color: #152b3c; }
++#connection-home .history-section { font-size: 18px; font-weight: bold; color: #24394a; }
++#connection-home .history-muted { font-size: 12px; color: #718094; }
++#connection-home entry { padding: 10px 12px; border-radius: 7px; }
++#connection-home button { border-radius: 7px; padding: 9px 16px; }
++#connection-home .history-card { background-color: #f6f8fb; border: 1px solid #dce4ed; border-radius: 10px; padding: 8px; }
++#connection-home button.history-connect { background-color: transparent; border: 1px solid transparent; padding: 4px; }
++#connection-home button.history-connect:hover { background-color: #e9f3f8; border-color: #8ac8dc; }
++#connection-home button.history-connect:focus { border-color: #00a1c1; }
++#connection-home button.history-connect label { color: #263c50; }
++#connection-home button.history-connect .history-name { font-size: 16px; font-weight: bold; }
++#connection-home button.history-connect .history-muted { color: #718094; }
++#connection-home button.history-remove { background-color: transparent; border-color: transparent; padding: 5px 8px; }
++#connection-home button.history-remove label { color: #718094; font-size: 12px; }
++#connection-home button.history-remove:hover { background-color: #edf0f4; }
++#connection-home flowboxchild { padding: 0; }
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index b8708f7..2546c1c 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -4,11 +4,11 @@ set(LIB_SOURCES
+ set(LIB_HEADERS
+     client-conn.h client-log.h flexvdi-port.h configuration.h client-request.h
+     printclient.h conn-forward.h)
+-set(CLIENT_SOURCES client-app.c client-win.c spice-win.c about.c)
++set(CLIENT_SOURCES client-app.c client-win.c spice-win.c about.c connection-history.c display-layout.c)
+ 
+ if (WIN32)
+     add_custom_target(ico_icon
+-                      COMMAND convert "${PROJECT_SOURCE_DIR}/resources/images/icon.png" icon.ico
++                      COMMAND magick "${PROJECT_SOURCE_DIR}/resources/images/icon.png" icon.ico
+                       DEPENDS "${PROJECT_SOURCE_DIR}/resources/images/icon.png")
+     file(WRITE icon.rc "IDI_ICON1 ICON DISCARDABLE \"${CMAKE_CURRENT_BINARY_DIR}/icon.ico\"")
+     set(LIB_SOURCES ${LIB_SOURCES}
+@@ -39,7 +39,8 @@ add_definitions(-DG_LOG_DOMAIN=\"flexvdi\" -DVERSION_STRING=\"${FLEXVDI_VERSION}
+ # libflexvdi-client
+ add_library(flexvdi-client SHARED ${LIB_SOURCES})
+ target_link_libraries(flexvdi-client ${LIB_LIBRARIES})
+-set_target_properties(flexvdi-client PROPERTIES PUBLIC_HEADER "${LIB_HEADERS}")
++set_target_properties(flexvdi-client PROPERTIES PUBLIC_HEADER "${LIB_HEADERS}"
++                      ARCHIVE_OUTPUT_NAME flexvdi-client-library)
+ if (APPLE)
+     target_compile_options(flexvdi-client PRIVATE -xobjective-c -mmacosx-version-min=10.10)
+     target_link_libraries(flexvdi-client "-framework Cocoa")
+diff --git a/src/client-app.c b/src/client-app.c
+index deff370..42531cc 100644
+--- a/src/client-app.c
++++ b/src/client-app.c
+@@ -86,6 +86,10 @@ struct _ClientApp {
+     gboolean autologin;
+     gboolean grab_disabled;
+     PrintJobManager * pjb;
++    gboolean history_mode;
++    guint inactivity_source, ungrab_source;
++    DisplayLayout *display_layout;
++    SpiceChannel *desktop_channel;
+ };
+ 
+ G_DEFINE_TYPE(ClientApp, client_app, GTK_TYPE_APPLICATION);
+@@ -209,6 +213,31 @@ static void network_changed(GNetworkMonitor * net_monitor, gboolean network_avai
+ static void client_app_configure(ClientApp * app, const gchar * error);
+ static void client_app_show_login(ClientApp * app, const gchar * error);
+ static void client_app_connect_with_spice_uri(ClientApp * app, const gchar * uri);
++static void history_connect(const gchar *uri, gboolean dx, gboolean low_latency, gboolean fullscreen, gpointer data);
++static void show_history(ClientApp *app) {
++    client_app_window_show_history(app->main_window, history_connect, app,
++        client_conn_selected_display() == 1, client_conf_get_fullscreen(app->conf));
++}
++
++static void history_connect(const gchar *uri, gboolean dx, gboolean low_latency, gboolean fullscreen, gpointer data) {
++    ClientApp *app = CLIENT_APP(data);
++    if (app->connection) return;
++    if (dx) {
++        GstElementFactory *decoder = gst_element_factory_find("d3d11h264dec");
++        if (!decoder) {
++            client_app_window_error(app->main_window, "此电脑无法使用 D3D11 H.264 硬解，请手动选择标准模式或检查显卡驱动。");
++            return;
++        }
++        gst_object_unref(decoder);
++    }
++    g_setenv("SPICE_DX_H264", dx ? "1" : "0", TRUE);
++    g_setenv("SPICE_DX_LOW_LATENCY", low_latency ? "1" : "0", TRUE);
++    client_conf_set_uri(app->conf, uri);
++    client_conf_set_fullscreen(app->conf, fullscreen);
++    client_app_window_status(app->main_window, "正在连接桌面...");
++    client_app_window_set_central_widget_sensitive(app->main_window, FALSE);
++    client_app_connect_with_spice_uri(app, client_conf_get_uri(app->conf));
++}
+ 
+ static void about_activated(GSimpleAction * action, GVariant * parameter, gpointer gapp) {
+     ClientApp * app = CLIENT_APP(gapp);
+@@ -271,6 +300,12 @@ static void client_app_activate(GApplication * gapp) {
+     g_signal_connect(app->main_window, "delete-event",
+         G_CALLBACK(delete_cb), app);
+ 
++    app->history_mode = client_conf_get_uri(app->conf) == NULL && !client_conf_get_kiosk_mode(app->conf);
++    if (app->history_mode) {
++        show_history(app);
++        return;
++    }
++
+     GNetworkMonitor * net_monitor = g_network_monitor_get_default();
+     g_debug("Using network monitor @0x%p, connectivity %d", net_monitor, g_network_monitor_get_connectivity(net_monitor));
+     if (g_network_monitor_get_network_available(net_monitor)) {
+@@ -417,6 +452,7 @@ static void desktop_selected_handler(ClientAppWindow * win, gpointer user_data)
+ static gboolean delete_cb(GtkWidget * widget, GdkEvent * event, gpointer user_data) {
+     ClientApp * app = CLIENT_APP(user_data);
+ 
++    if (SPICE_IS_WIN(widget)) spice_window_save_history(SPICE_WIN(widget));
+     if (app->connection)
+         client_conn_disconnect(app->connection, CLIENT_CONN_DISCONNECT_USER);
+     if (app->main_window != NULL && GTK_WIDGET(app->main_window) == widget) {
+@@ -646,6 +682,10 @@ void usb_connect_failed(GObject * object, SpiceUsbDevice * device,
+                         GError * error, gpointer user_data);
+ static gboolean check_inactivity(gpointer user_data);
+ static gboolean check_ungrab(gpointer user_data);
++static void display_monitors(SpiceChannel *display, GParamSpec *pspec, ClientApp *app);
++static void layout_changed(DisplayLayout *layout, ClientApp *app) {
++    if (app->desktop_channel) display_monitors(app->desktop_channel, NULL, app);
++}
+ 
+ /*
+  * Start the Spice connection with the current parameters, in the configuration object.
+@@ -655,6 +695,10 @@ static gboolean check_ungrab(gpointer user_data);
+  */
+ static void client_app_connect(ClientApp * app) {
+     SpiceSession * session = client_conn_get_session(app->connection);
++    if (client_conn_selected_display() == 1) {
++        app->display_layout = display_layout_new(app->connection);
++        g_signal_connect_object(app->display_layout, "changed", G_CALLBACK(layout_changed), app, 0);
++    }
+     client_conf_set_gtk_session_options(app->conf, G_OBJECT(spice_gtk_session_get(session)));
+     g_signal_connect(session, "channel-new",
+                      G_CALLBACK(channel_new), app);
+@@ -715,6 +759,11 @@ static void channel_new(SpiceSession * s, SpiceChannel * channel, gpointer user_
+     }
+ 
+     if (SPICE_IS_DISPLAY_CHANNEL(channel)) {
++        gint channel_id;
++        g_object_get(channel, "channel-id", &channel_id, NULL);
++        if (channel_id != client_conn_selected_display())
++            return;
++        g_set_object(&app->desktop_channel, channel);
+         g_signal_connect(channel, "notify::monitors",
+                          G_CALLBACK(display_monitors), app);
+     }
+@@ -753,6 +802,26 @@ static void connection_disconnected(ClientConn * conn, ClientConnDisconnectReaso
+                                     gpointer user_data) {
+     ClientApp * app = CLIENT_APP(user_data);
+ 
++    if (app->inactivity_source) { g_source_remove(app->inactivity_source); app->inactivity_source = 0; }
++    g_clear_object(&app->display_layout);
++    g_clear_object(&app->desktop_channel);
++    if (app->ungrab_source) { g_source_remove(app->ungrab_source); app->ungrab_source = 0; }
++    if (app->history_mode) {
++        GList *windows = g_list_copy(gtk_application_get_windows(GTK_APPLICATION(app)));
++        for (GList *p = windows; p; p = p->next)
++            if (SPICE_IS_WIN(p->data)) gtk_widget_destroy(p->data);
++        g_list_free(windows);
++        app->main = NULL;
++        g_clear_object(&app->connection);
++        app->grab_disabled = FALSE;
++        if (app->main_window) {
++            show_history(app);
++            if (reason != CLIENT_CONN_DISCONNECT_USER && reason != CLIENT_CONN_DISCONNECT_NO_ERROR)
++                client_app_window_error(app->main_window, "连接已中断或无法建立，请检查地址和服务器状态后重试。");
++        }
++        return;
++    }
++
+     if (app->main_window) {
+         client_app_show_login(app, "Failed to establish the connection, see the log file for further information.");
+         client_app_window_set_central_widget_sensitive(app->main_window, TRUE);
+@@ -784,6 +853,21 @@ static void spice_win_display_mark(SpiceChannel * channel, gint mark, SpiceWindo
+ static void set_cp_sensitive(SpiceWindow * win, ClientApp * app);
+ static void user_activity_cb(SpiceWindow * win, ClientApp * app);
+ 
++static gboolean hide_secondary(GtkWidget *window, GdkEvent *event, gpointer unused) {
++    spice_win_release_mouse_pointer(SPICE_WIN(window));
++    g_object_set_data(G_OBJECT(window), "user-hidden", GINT_TO_POINTER(1));
++    gtk_widget_hide(window);
++    return TRUE;
++}
++
++static gboolean display_window_delete(GtkWidget *window, GdkEvent *event, ClientApp *app) {
++    const GArray *remote = display_layout_get_monitors(app->display_layout);
++    gint primary = remote && remote->len ? g_array_index(remote, RemoteMonitor, 0).id : 0;
++    if (spice_window_get_monitor(SPICE_WIN(window)) == primary)
++        return delete_cb(window, event, app);
++    return hide_secondary(window, event, NULL);
++}
++
+ /*
+  * Monitor changes handler. Creates a SpiceWindow for each new monitor.
+  * Currently, multimonitor configurations are still not fully supported.
+@@ -798,25 +882,39 @@ static void display_monitors(SpiceChannel * display, GParamSpec * pspec, ClientA
+                  "monitors", &monitors,
+                  NULL);
+     g_return_if_fail(monitors != NULL);
+-    g_return_if_fail(id == 0); // Only one display channel supported
++    g_return_if_fail(id == client_conn_selected_display());
+     g_debug("Reported %d monitors in display channel %d", monitors->len, id);
+ 
+-    for (i = 0; i < monitors->len; ++i) {
+-        if (!get_window_for_monitor(app, i)) {
++    const GArray *remote = display_layout_get_monitors(app->display_layout);
++    guint count = remote && remote->len ? remote->len : monitors->len;
++    GList *windows = g_list_copy(gtk_application_get_windows(GTK_APPLICATION(app)));
++    for (GList *p = windows; p; p = p->next) {
++        if (!SPICE_IS_WIN(p->data)) continue;
++        gint window_id = spice_window_get_monitor(p->data);
++        gboolean exists = FALSE;
++        for (guint n = 0; n < count; n++)
++            if (window_id == (remote && remote->len ? g_array_index(remote, RemoteMonitor, n).id : (gint)n))
++                exists = TRUE;
++        if (!exists) gtk_widget_destroy(p->data);
++    }
++    g_list_free(windows);
++
++    for (i = 0; i < count; ++i) {
++        gint monitor_id = remote && remote->len ? g_array_index(remote, RemoteMonitor, i).id : (gint)i;
++        if (!get_window_for_monitor(app, monitor_id)) {
+             g_autofree gchar * name = NULL;
+             if (app->desktop_name) {
+                 name = g_strdup(app->desktop_name);
+             } else {
+                 g_object_get(client_conn_get_session(app->connection), "name", &name, NULL);
+             }
+-            g_autofree gchar * title = g_strdup_printf("%s - flexVDI Client", name);
+-            SpiceWindow * win = spice_window_new(app->connection, display, app->conf, i, title);
++            g_autofree gchar * title = g_strdup_printf("%s — 显示器 %u - flexVDI Client", name, monitor_id + 1);
++            SpiceWindow * win = spice_window_new(app->connection, display, app->conf, monitor_id, title);
+             // Inform GTK that this is an application window
+             gtk_application_add_window(GTK_APPLICATION(app), GTK_WINDOW(win));
+             spice_g_signal_connect_object(display, "display-mark",
+                                           G_CALLBACK(spice_win_display_mark), win, 0);
+             if (i == 0) {
+-                g_signal_connect(win, "delete-event", G_CALLBACK(delete_cb), app);
+ 
+                 // Start the inactivity timeout when the first window is created
+                 app->last_input_time = g_get_monotonic_time();
+@@ -826,19 +924,44 @@ static void display_monitors(SpiceChannel * display, GParamSpec * pspec, ClientA
+                 }
+                 check_ungrab(app);
+             }
++            g_signal_connect(win, "delete-event", G_CALLBACK(display_window_delete), app);
++            if (app->display_layout) spice_window_add_displays_button(win, app->display_layout);
+             g_signal_connect(win, "user-activity", G_CALLBACK(user_activity_cb), app);
+-            if (monitors->len == 1)
++            if (count == 1)
+                 gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER);
++            else {
++                spice_window_start_windowed(win);
++                gtk_window_set_default_size(GTK_WINDOW(win), 960, 640);
++                gtk_window_move(GTK_WINDOW(win), 80 + 60 * i, 80 + 40 * i);
++            }
++            if (remote && remote->len) {
++                const RemoteMonitor *m = &g_array_index(remote, RemoteMonitor, i);
++                GdkRectangle workarea;
++                gdk_monitor_get_workarea(gdk_display_get_primary_monitor(gdk_display_get_default()), &workarea);
++                gtk_window_set_default_size(GTK_WINDOW(win), MIN(m->width, workarea.width * 9 / 10),
++                    MIN(m->height + 48, workarea.height * 9 / 10));
++            }
+             gtk_widget_show_all(GTK_WIDGET(win));
+             set_cp_sensitive(win, app);
+             if (app->main_window) {
+-                gtk_widget_destroy(GTK_WIDGET(app->main_window));
+-                app->main_window = NULL;
++                if (app->history_mode) gtk_widget_hide(GTK_WIDGET(app->main_window));
++                else {
++                    gtk_widget_destroy(GTK_WIDGET(app->main_window));
++                    app->main_window = NULL;
++                }
+                 GSimpleAction * prefs_action =
+                     G_SIMPLE_ACTION(g_action_map_lookup_action(G_ACTION_MAP(app), "preferences"));
+                 g_simple_action_set_enabled(prefs_action, FALSE);
+             }
+         }
++        SpiceWindow *window = get_window_for_monitor(app, monitor_id);
++        if (window) {
++            if (remote && remote->len)
++                spice_window_set_remote_monitor(window, &g_array_index(remote, RemoteMonitor, i));
++            if (display_layout_should_reveal(app->display_layout))
++                g_object_set_data(G_OBJECT(window), "user-hidden", NULL);
++            if (!g_object_get_data(G_OBJECT(window), "user-hidden")) gtk_widget_show(GTK_WIDGET(window));
++        }
+     }
+ 
+     g_clear_pointer(&monitors, g_array_unref);
+@@ -846,7 +969,7 @@ static void display_monitors(SpiceChannel * display, GParamSpec * pspec, ClientA
+ 
+ 
+ static void spice_win_display_mark(SpiceChannel * channel, gint mark, SpiceWindow * win) {
+-    if (mark) {
++    if (mark && !g_object_get_data(G_OBJECT(win), "user-hidden")) {
+         gtk_widget_show(GTK_WIDGET(win));
+     } else {
+         gtk_widget_hide(GTK_WIDGET(win));
+@@ -916,6 +1039,8 @@ static void user_activity_cb(SpiceWindow * win, ClientApp * app) {
+  */
+ static gboolean check_inactivity(gpointer user_data) {
+     ClientApp * app = CLIENT_APP(user_data);
++    app->inactivity_source = 0;
++    if (!app->connection) return FALSE;
+     gint inactivity_timeout = client_conf_get_inactivity_timeout(app->conf);
+     gint64 now = g_get_monotonic_time();
+     gint time_to_inactivity = (app->last_input_time - now)/1000 + inactivity_timeout*1000;
+@@ -923,7 +1048,7 @@ static gboolean check_inactivity(gpointer user_data) {
+     if (time_to_inactivity <= 0) {
+         client_conn_disconnect(app->connection, CLIENT_CONN_DISCONNECT_INACTIVITY);
+     } else if (time_to_inactivity <= 30000) {
+-        g_timeout_add(100, check_inactivity, app);
++        app->inactivity_source = g_timeout_add(100, check_inactivity, app);
+         GtkWindow * win = gtk_application_get_active_window(GTK_APPLICATION(app));
+         if (win != NULL && SPICE_IS_WIN(win)) {
+             int seconds = (time_to_inactivity + 999) / 1000;
+@@ -932,7 +1057,7 @@ static gboolean check_inactivity(gpointer user_data) {
+             spice_win_show_notification(SPICE_WIN(win), text, 200);
+         }
+     } else {
+-        g_timeout_add(time_to_inactivity - 30000, check_inactivity, app);
++        app->inactivity_source = g_timeout_add(time_to_inactivity - 30000, check_inactivity, app);
+     }
+ 
+     return FALSE;
+@@ -941,6 +1066,8 @@ static gboolean check_inactivity(gpointer user_data) {
+ 
+ static gboolean check_ungrab(gpointer user_data) {
+     ClientApp * app = CLIENT_APP(user_data);
++    app->ungrab_source = 0;
++    if (!app->connection) return FALSE;
+     gint64 now = g_get_monotonic_time();
+     // Ungrab after 55 seconds, to avoid race condition with a 1-minute screenlock timeout
+     gint time_to_ungrab = (app->last_input_time - now)/1000 + 55000;
+@@ -955,7 +1082,7 @@ static gboolean check_ungrab(gpointer user_data) {
+         }
+         app->grab_disabled = TRUE;
+     } else {
+-        g_timeout_add(time_to_ungrab, check_ungrab, app);
++        app->ungrab_source = g_timeout_add(time_to_ungrab, check_ungrab, app);
+     }
+ 
+     return FALSE;
+diff --git a/src/client-conn.c b/src/client-conn.c
+index b14f96c..3aa1862 100644
+--- a/src/client-conn.c
++++ b/src/client-conn.c
+@@ -48,6 +48,10 @@ enum {
+ 
+ static guint signals[CLIENT_CONN_LAST_SIGNAL];
+ 
++gint client_conn_selected_display(void) {
++    return g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0 ? 1 : 0;
++}
++
+ G_DEFINE_TYPE(ClientConn, client_conn, G_TYPE_OBJECT);
+ 
+ 
+@@ -204,7 +208,13 @@ static void channel_new(SpiceSession * s, SpiceChannel * channel, gpointer data)
+     }
+ 
+     if (SPICE_IS_DISPLAY_CHANNEL(channel)) {
+-        spice_channel_connect(channel);
++        if (id == client_conn_selected_display()) {
++            g_message("Connecting selected display channel %d (%s)", id,
++                      id == 1 ? "full-desktop H.264" : "standard display");
++            spice_channel_connect(channel);
++        } else {
++            g_message("Leaving unselected display channel %d disconnected", id);
++        }
+     }
+ 
+     if (SPICE_IS_PLAYBACK_CHANNEL(channel)) {
+diff --git a/src/client-conn.h b/src/client-conn.h
+index 93976f1..e7c0bf9 100644
+--- a/src/client-conn.h
++++ b/src/client-conn.h
+@@ -87,6 +87,9 @@ void client_conn_disconnect(ClientConn * conn, ClientConnDisconnectReason reason
+  */
+ SpiceSession * client_conn_get_session(ClientConn * conn);
+ 
++/* VM 106: channel 0 is VirtIO, channel 1 is the full-desktop streaming agent. */
++gint client_conn_selected_display(void);
++
+ /*
+  * client_conn_get_main_channel
+  *
+diff --git a/src/client-win.c b/src/client-win.c
+index 06039f7..776b952 100644
+--- a/src/client-win.c
++++ b/src/client-win.c
+@@ -460,3 +460,27 @@ gchar * client_app_window_get_desktop(ClientAppWindow * win) {
+ void client_app_window_hide_config_button(ClientAppWindow * win) {
+     gtk_widget_hide(GTK_WIDGET(win->config));
+ }
++
++void client_app_window_show_history(ClientAppWindow *win, ClientHistoryConnect connect,
++                                    gpointer user_data, gboolean dx, gboolean fullscreen) {
++    GtkWidget *old = gtk_stack_get_child_by_name(win->stack, "history");
++    if (old) gtk_widget_destroy(old);
++    GtkWidget *home = client_history_view_new(connect, user_data, dx, fullscreen);
++    gtk_stack_add_named(win->stack, home, "history");
++    gtk_stack_set_homogeneous(win->stack, FALSE);
++    gtk_widget_set_margin_start(GTK_WIDGET(win->stack), 28);
++    gtk_widget_set_margin_end(GTK_WIDGET(win->stack), 28);
++    gtk_widget_set_margin_bottom(GTK_WIDGET(win->stack), 16);
++    gtk_widget_set_valign(GTK_WIDGET(win->stack), GTK_ALIGN_FILL);
++    gtk_window_set_title(GTK_WINDOW(win), "SPICE 连接中心");
++    gtk_window_set_resizable(GTK_WINDOW(win), TRUE);
++    gtk_window_set_default_size(GTK_WINDOW(win), 960, 760);
++    if (!old) gtk_window_resize(GTK_WINDOW(win), 960, 760);
++    gtk_widget_show_all(GTK_WIDGET(win));
++    gtk_widget_hide(GTK_WIDGET(win->logo_client));
++    gtk_widget_hide(GTK_WIDGET(win->config));
++    gtk_label_set_text(win->info, "连接历史");
++    client_app_window_set_central_widget(win, "history");
++    client_app_window_set_central_widget_sensitive(win, TRUE);
++    gtk_window_present(GTK_WINDOW(win));
++}
+diff --git a/src/client-win.h b/src/client-win.h
+index 3b7f419..b0dd715 100644
+--- a/src/client-win.h
++++ b/src/client-win.h
+@@ -23,6 +23,7 @@
+ #include <gtk/gtk.h>
+ #include "client-app.h"
+ #include "configuration.h"
++#include "connection-history.h"
+ 
+ 
+ /*
+@@ -34,7 +35,7 @@
+ #define CLIENT_APP_WINDOW_TYPE (client_app_window_get_type ())
+ G_DECLARE_FINAL_TYPE(ClientAppWindow, client_app_window, CLIENT, APP_WINDOW, GtkApplicationWindow)
+ 
+-enum {
++typedef enum {
+     SETTINGS_BUTTON = 0,
+     ABOUT_BUTTON,
+     SAVE_BUTTON,
+@@ -145,6 +146,8 @@ gchar * client_app_window_get_desktop(ClientAppWindow * win);
+  * Hide the configuration button.
+  */
+ void client_app_window_hide_config_button(ClientAppWindow * win);
++void client_app_window_show_history(ClientAppWindow *win, ClientHistoryConnect connect,
++                                    gpointer user_data, gboolean dx, gboolean fullscreen);
+ 
+ 
+ #endif /* _CLIENT_WIN_H */
+diff --git a/src/configuration.c b/src/configuration.c
+index 38fec36..eda1f7a 100644
+--- a/src/configuration.c
++++ b/src/configuration.c
+@@ -435,7 +435,7 @@ void client_conf_set_display_options(ClientConf * conf, GObject * display, gbool
+     g_object_set(display,
+         "grab-keyboard", TRUE && grab_enable,
+         "grab-mouse", conf->grab_mouse && grab_enable,
+-        "resize-guest", conf->resize_guest,
++        "resize-guest", conf->resize_guest && g_strcmp0(g_getenv("SPICE_DX_H264"), "1") != 0,
+         "scaling", TRUE,
+         "disable-inputs", FALSE,
+         NULL);
+diff --git a/src/connection-history.c b/src/connection-history.c
+new file mode 100644
+index 0000000..72264ba
+--- /dev/null
++++ b/src/connection-history.c
+@@ -0,0 +1,361 @@
++/* Local connection history. SPDX-License-Identifier: GPL-3.0-or-later */
++#include "connection-history.h"
++#include <glib/gstdio.h>
++#include <string.h>
++
++#define HISTORY_LIMIT 50
++#define PREVIEW_WIDTH 256
++#define PREVIEW_HEIGHT 144
++
++typedef struct {
++    gchar *id, *uri, *name;
++    gint64 connected_at;
++    gboolean dx, low_latency;
++} HistoryEntry;
++
++static gchar *history_dir(void) {
++    return g_build_filename(g_get_user_data_dir(), "flexvdi-client", "history", NULL);
++}
++
++static gchar *entry_path(const gchar *id, const gchar *extension) {
++    g_autofree gchar *dir = history_dir();
++    g_autofree gchar *filename = g_strconcat(id, extension, NULL);
++    return g_build_filename(dir, filename, NULL);
++}
++
++static void entry_free(gpointer data) {
++    HistoryEntry *entry = data;
++    g_free(entry->id); g_free(entry->uri); g_free(entry->name); g_free(entry);
++}
++
++static gboolean valid_port(const gchar *port) {
++    if (!port || !*port) return FALSE;
++    for (const gchar *p = port; *p; ++p) if (!g_ascii_isdigit(*p)) return FALSE;
++    guint64 value = g_ascii_strtoull(port, NULL, 10);
++    return value > 0 && value <= 65535;
++}
++
++static gchar *invalid_uri(GError **error) {
++    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                        "请输入有效的 SPICE 地址，例如 spice://127.0.0.1:5900");
++    return NULL;
++}
++
++gchar *client_history_normalize_uri(const gchar *input, GError **error) {
++    g_autofree gchar *trimmed = g_strdup(input ? input : "");
++    g_strstrip(trimmed);
++    g_autofree gchar *address = strstr(trimmed, "://") ? g_strdup(trimmed) :
++                                g_strconcat("spice://", trimmed, NULL);
++    g_autoptr(GUri) uri = g_uri_parse(address, G_URI_FLAGS_HAS_PASSWORD, NULL);
++    if (!uri || g_strcmp0(g_uri_get_scheme(uri), "spice") ||
++        !g_uri_get_host(uri) || !*g_uri_get_host(uri) ||
++        (g_uri_get_path(uri) && *g_uri_get_path(uri) && strcmp(g_uri_get_path(uri), "/")))
++        return invalid_uri(error);
++    const gchar *query = g_uri_get_query(uri);
++    g_autoptr(GHashTable) params = query ? g_uri_parse_params(query, -1, "&", G_URI_PARAMS_NONE, NULL) : NULL;
++    if (query && !params) return invalid_uri(error);
++    const gchar *tls = params ? g_hash_table_lookup(params, "tls-port") : NULL;
++    const gchar *qport = params ? g_hash_table_lookup(params, "port") : NULL;
++    gint port = g_uri_get_port(uri);
++    if ((tls && !valid_port(tls)) || (qport && !valid_port(qport)) || port == 0 || port > 65535)
++        return invalid_uri(error);
++    if (qport) port = (gint)g_ascii_strtoull(qport, NULL, 10);
++    if (port < 0 && !tls) port = 5900;
++    g_autofree gchar *host = g_ascii_strdown(g_uri_get_host(uri), -1);
++    g_autofree gchar *authority = strchr(host, ':') ? g_strdup_printf("[%s]", host) : g_strdup(host);
++    g_autofree gchar *plain = port > 0 ? g_strdup_printf(":%d", port) : g_strdup("");
++    g_autofree gchar *secure = tls ? g_strdup_printf("?tls-port=%u", (guint)g_ascii_strtoull(tls, NULL, 10)) : g_strdup("");
++    /* Only endpoint fields are persisted: no userinfo, password, token or fragment. */
++    return g_strdup_printf("spice://%s%s%s", authority, plain, secure);
++}
++
++static gint entry_compare(gconstpointer a, gconstpointer b) {
++    const HistoryEntry *ea = *(HistoryEntry *const *)a, *eb = *(HistoryEntry *const *)b;
++    return ea->connected_at < eb->connected_at ? 1 : ea->connected_at > eb->connected_at ? -1 : g_strcmp0(ea->id, eb->id);
++}
++
++static GPtrArray *history_load(void) {
++    GPtrArray *entries = g_ptr_array_new_with_free_func(entry_free);
++    g_autofree gchar *dir = history_dir();
++    GDir *listing = g_dir_open(dir, 0, NULL);
++    if (!listing) return entries;
++    const gchar *filename;
++    while ((filename = g_dir_read_name(listing))) {
++        if (strlen(filename) != 68 || strcmp(filename + 64, ".ini")) continue;
++        gboolean valid = TRUE;
++        for (guint i = 0; i < 64; i++) if (!g_ascii_isxdigit(filename[i])) valid = FALSE;
++        if (!valid) continue;
++        g_autofree gchar *path = g_build_filename(dir, filename, NULL);
++        g_autoptr(GKeyFile) key = g_key_file_new();
++        if (!g_key_file_load_from_file(key, path, G_KEY_FILE_NONE, NULL)) continue;
++        g_autofree gchar *uri = g_key_file_get_string(key, "Connection", "uri", NULL);
++        g_autofree gchar *canonical = client_history_normalize_uri(uri, NULL);
++        if (!uri || !canonical || strcmp(uri, canonical)) continue;
++        g_autofree gchar *digest = g_compute_checksum_for_string(G_CHECKSUM_SHA256, uri, -1);
++        if (strncmp(filename, digest, 64)) continue;
++        HistoryEntry *entry = g_new0(HistoryEntry, 1);
++        entry->id = g_strdup(digest);
++        entry->uri = g_strdup(uri);
++        entry->name = g_key_file_get_string(key, "Connection", "name", NULL);
++        if (!entry->name || !*entry->name) { g_free(entry->name); entry->name = g_strdup(uri); }
++        entry->connected_at = g_key_file_get_int64(key, "Connection", "last-connected", NULL);
++        entry->dx = g_key_file_get_boolean(key, "Connection", "dx", NULL);
++        entry->low_latency = !g_key_file_has_key(key, "Connection", "low-latency", NULL) ||
++                             g_key_file_get_boolean(key, "Connection", "low-latency", NULL);
++        g_ptr_array_add(entries, entry);
++    }
++    g_dir_close(listing);
++    g_ptr_array_sort(entries, entry_compare);
++    return entries;
++}
++
++static gboolean history_remove(const gchar *id, GError **error) {
++    g_autofree gchar *record = entry_path(id, ".ini");
++    g_autofree gchar *image = entry_path(id, ".png");
++    if (g_file_test(image, G_FILE_TEST_EXISTS) && g_unlink(image) != 0) {
++        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, "无法删除桌面缩略图，请检查文件权限。");
++        return FALSE;
++    }
++    if (g_unlink(record) != 0 && g_file_test(record, G_FILE_TEST_EXISTS)) {
++        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, "无法删除连接记录，请检查文件权限。");
++        return FALSE;
++    }
++    return TRUE;
++}
++
++void client_history_record(const gchar *uri, const gchar *name, gboolean dx,
++                           gint64 connected_at, GdkPixbuf *desktop, gboolean first) {
++    g_autofree gchar *canonical = client_history_normalize_uri(uri, NULL);
++    if (!canonical || !desktop) return;
++    g_autofree gchar *id = g_compute_checksum_for_string(G_CHECKSUM_SHA256, canonical, -1);
++    g_autofree gchar *record = entry_path(id, ".ini");
++    /* A record deleted during an active connection must stay deleted. */
++    if (!first && !g_file_test(record, G_FILE_TEST_EXISTS)) return;
++    g_autofree gchar *dir = history_dir();
++    if (g_mkdir_with_parents(dir, 0700) != 0) { g_warning("Cannot create connection history directory"); return; }
++    g_autoptr(GKeyFile) key = g_key_file_new();
++    g_key_file_load_from_file(key, record, G_KEY_FILE_NONE, NULL);
++    if (g_key_file_get_int64(key, "Connection", "last-connected", NULL) > connected_at) return;
++    g_autoptr(GdkPixbuf) preview = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, PREVIEW_WIDTH, PREVIEW_HEIGHT);
++    gdk_pixbuf_fill(preview, 0x182334ff);
++    gdouble scale = MIN((gdouble)PREVIEW_WIDTH / gdk_pixbuf_get_width(desktop),
++                        (gdouble)PREVIEW_HEIGHT / gdk_pixbuf_get_height(desktop));
++    gint width = MAX(1, (gint)(gdk_pixbuf_get_width(desktop) * scale));
++    gint height = MAX(1, (gint)(gdk_pixbuf_get_height(desktop) * scale));
++    gint x = (PREVIEW_WIDTH - width) / 2, y = (PREVIEW_HEIGHT - height) / 2;
++    gdk_pixbuf_scale(desktop, preview, x, y, width, height, x, y, scale, scale, GDK_INTERP_BILINEAR);
++    g_autofree gchar *png = NULL;
++    g_autofree gchar *data = NULL;
++    gsize size = 0;
++    g_autoptr(GError) error = NULL;
++    g_autofree gchar *image = entry_path(id, ".png");
++    if (!gdk_pixbuf_save_to_buffer(preview, &png, &size, "png", &error, NULL) ||
++        !g_file_set_contents(image, png, size, &error)) goto failed;
++    g_key_file_set_string(key, "Connection", "uri", canonical);
++    g_key_file_set_string(key, "Connection", "name", name && *name ? name : canonical);
++    g_key_file_set_int64(key, "Connection", "last-connected", connected_at);
++    g_key_file_set_boolean(key, "Connection", "dx", dx);
++    g_key_file_set_boolean(key, "Connection", "low-latency", g_strcmp0(g_getenv("SPICE_DX_LOW_LATENCY"), "0") != 0);
++    data = g_key_file_to_data(key, &size, NULL);
++    if (!g_file_set_contents(record, data, size, &error)) goto failed;
++    if (first) {
++        g_autoptr(GPtrArray) entries = history_load();
++        for (guint i = HISTORY_LIMIT; i < entries->len; i++)
++            history_remove(((HistoryEntry *)g_ptr_array_index(entries, i))->id, NULL);
++        g_message("History: saved successful connection and desktop thumbnail");
++    }
++    return;
++failed:
++    g_warning("Cannot save connection history: %s", error ? error->message : "unknown error");
++}
++
++typedef struct {
++    GtkWidget *root, *flow, *empty, *count, *entry, *dx, *low_latency, *fullscreen, *clear;
++    ClientHistoryConnect connect;
++    gpointer user_data;
++} HistoryView;
++
++static void refresh_view(HistoryView *view);
++
++static void show_error(HistoryView *view, const gchar *text) {
++    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(gtk_widget_get_toplevel(view->root)),
++        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE, "%s", text);
++    gtk_dialog_run(GTK_DIALOG(dialog));
++    gtk_widget_destroy(dialog);
++}
++
++static void connect_address(GtkWidget *source, HistoryView *view) {
++    g_autoptr(GError) error = NULL;
++    g_autofree gchar *uri = client_history_normalize_uri(gtk_entry_get_text(GTK_ENTRY(view->entry)), &error);
++    if (!uri) { show_error(view, error->message); return; }
++    view->connect(uri, gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(view->dx)),
++                  gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(view->low_latency)),
++                  gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(view->fullscreen)), view->user_data);
++}
++
++static void connect_recent(GtkButton *button, HistoryView *view) {
++    const gchar *uri = g_object_get_data(G_OBJECT(button), "uri");
++    gboolean dx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "dx"));
++    gtk_entry_set_text(GTK_ENTRY(view->entry), uri);
++    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(view->dx), dx);
++    gboolean low_latency = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "low-latency"));
++    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(view->low_latency), low_latency);
++    view->connect(uri, dx, low_latency, gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(view->fullscreen)), view->user_data);
++}
++
++static void delete_recent(GtkButton *button, HistoryView *view) {
++    g_autofree gchar *id = g_strdup(g_object_get_data(G_OBJECT(button), "id"));
++    g_autoptr(GError) error = NULL;
++    if (!history_remove(id, &error)) show_error(view, error->message);
++    refresh_view(view);
++}
++
++static void clear_history(GtkButton *button, HistoryView *view) {
++    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(gtk_widget_get_toplevel(view->root)),
++        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE,
++        "清空所有连接历史和桌面缩略图？");
++    gtk_dialog_add_buttons(GTK_DIALOG(dialog), "取消", GTK_RESPONSE_CANCEL, "清空历史", GTK_RESPONSE_ACCEPT, NULL);
++    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
++    gtk_widget_destroy(dialog);
++    if (response != GTK_RESPONSE_ACCEPT) return;
++    g_autoptr(GPtrArray) entries = history_load();
++    for (guint i = 0; i < entries->len; i++) {
++        g_autoptr(GError) error = NULL;
++        if (!history_remove(((HistoryEntry *)g_ptr_array_index(entries, i))->id, &error)) {
++            show_error(view, error->message); break;
++        }
++    }
++    refresh_view(view);
++}
++
++static GtkWidget *text_label(const gchar *text, const gchar *css) {
++    GtkWidget *label = gtk_label_new(text);
++    gtk_label_set_xalign(GTK_LABEL(label), 0);
++    if (css) gtk_style_context_add_class(gtk_widget_get_style_context(label), css);
++    return label;
++}
++
++static void refresh_view(HistoryView *view) {
++    GList *children = gtk_container_get_children(GTK_CONTAINER(view->flow));
++    for (GList *p = children; p; p = p->next) gtk_widget_destroy(p->data);
++    g_list_free(children);
++    g_autoptr(GPtrArray) entries = history_load();
++    g_autofree gchar *count = g_strdup_printf("最近连接  ·  %u", entries->len);
++    gtk_label_set_text(GTK_LABEL(view->count), count);
++    gtk_widget_set_sensitive(view->clear, entries->len > 0);
++    for (guint i = 0; i < entries->len; i++) {
++        HistoryEntry *entry = g_ptr_array_index(entries, i);
++        GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
++        gtk_widget_set_halign(card, GTK_ALIGN_START);
++        gtk_style_context_add_class(gtk_widget_get_style_context(card), "history-card");
++        GtkWidget *button = gtk_button_new();
++        gtk_style_context_add_class(gtk_widget_get_style_context(button), "history-connect");
++        gtk_widget_set_tooltip_text(button, "点击连接这台桌面");
++        g_object_set_data_full(G_OBJECT(button), "uri", g_strdup(entry->uri), g_free);
++        g_object_set_data(G_OBJECT(button), "dx", GINT_TO_POINTER(entry->dx));
++        g_object_set_data(G_OBJECT(button), "low-latency", GINT_TO_POINTER(entry->low_latency));
++        g_signal_connect(button, "clicked", G_CALLBACK(connect_recent), view);
++        GtkWidget *body = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
++        g_autofree gchar *path = entry_path(entry->id, ".png");
++        g_autoptr(GdkPixbuf) preview = gdk_pixbuf_new_from_file_at_scale(path, PREVIEW_WIDTH, PREVIEW_HEIGHT, TRUE, NULL);
++        GtkWidget *image = preview ? gtk_image_new_from_pixbuf(preview) : gtk_image_new_from_icon_name("computer-symbolic", GTK_ICON_SIZE_DIALOG);
++        gtk_widget_set_size_request(image, PREVIEW_WIDTH, PREVIEW_HEIGHT);
++        gtk_box_pack_start(GTK_BOX(body), image, FALSE, FALSE, 0);
++        GtkWidget *title = text_label(entry->name, "history-name");
++        gtk_label_set_ellipsize(GTK_LABEL(title), PANGO_ELLIPSIZE_END);
++        gtk_label_set_max_width_chars(GTK_LABEL(title), 24);
++        gtk_widget_set_tooltip_text(title, entry->name);
++        gtk_box_pack_start(GTK_BOX(body), title, FALSE, FALSE, 0);
++        GtkWidget *address = text_label(entry->uri, "history-muted");
++        gtk_label_set_ellipsize(GTK_LABEL(address), PANGO_ELLIPSIZE_MIDDLE);
++        gtk_label_set_max_width_chars(GTK_LABEL(address), 28);
++        gtk_widget_set_tooltip_text(address, entry->uri);
++        gtk_box_pack_start(GTK_BOX(body), address, FALSE, FALSE, 0);
++        g_autoptr(GDateTime) utc = g_date_time_new_from_unix_utc(entry->connected_at);
++        g_autoptr(GDateTime) local = utc ? g_date_time_to_local(utc) : NULL;
++        g_autofree gchar *date = local ? g_date_time_format(local, "%m月%d日 %H:%M") : g_strdup("时间未知");
++        g_autofree gchar *details = g_strdup_printf("%s  ·  %s", date,
++            entry->dx ? (entry->low_latency ? "DX · 低延迟" : "DX · 音画同步") : "标准 SPICE");
++        gtk_box_pack_start(GTK_BOX(body), text_label(details, "history-muted"), FALSE, FALSE, 0);
++        gtk_container_add(GTK_CONTAINER(button), body);
++        gtk_box_pack_start(GTK_BOX(card), button, TRUE, TRUE, 0);
++        GtkWidget *remove = gtk_button_new_with_label("移除记录");
++        gtk_widget_set_halign(remove, GTK_ALIGN_END);
++        gtk_style_context_add_class(gtk_widget_get_style_context(remove), "history-remove");
++        g_object_set_data_full(G_OBJECT(remove), "id", g_strdup(entry->id), g_free);
++        g_signal_connect(remove, "clicked", G_CALLBACK(delete_recent), view);
++        gtk_box_pack_start(GTK_BOX(card), remove, FALSE, FALSE, 0);
++        gtk_flow_box_insert(GTK_FLOW_BOX(view->flow), card, -1);
++    }
++    gtk_widget_show_all(view->flow);
++    gtk_widget_set_visible(view->empty, entries->len == 0);
++}
++
++GtkWidget *client_history_view_new(ClientHistoryConnect connect, gpointer user_data,
++                                  gboolean dx, gboolean fullscreen) {
++    HistoryView *view = g_new0(HistoryView, 1);
++    view->connect = connect; view->user_data = user_data;
++    view->root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
++    gtk_widget_set_name(view->root, "connection-home");
++    g_object_set_data_full(G_OBJECT(view->root), "history-view", view, g_free);
++    gtk_box_pack_start(GTK_BOX(view->root), text_label("我的远程桌面", "history-heading"), FALSE, FALSE, 0);
++    gtk_box_pack_start(GTK_BOX(view->root), text_label("选择最近使用的桌面，或输入地址开始新的连接。", "history-muted"), FALSE, FALSE, 0);
++    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
++    view->entry = gtk_entry_new();
++    gtk_entry_set_placeholder_text(GTK_ENTRY(view->entry), "spice://服务器地址:端口");
++    gtk_widget_set_hexpand(view->entry, TRUE);
++    g_signal_connect(view->entry, "activate", G_CALLBACK(connect_address), view);
++    gtk_box_pack_start(GTK_BOX(row), view->entry, TRUE, TRUE, 0);
++    GtkWidget *button = gtk_button_new_with_label("连接桌面");
++    gtk_style_context_add_class(gtk_widget_get_style_context(button), "suggested-action");
++    g_signal_connect(button, "clicked", G_CALLBACK(connect_address), view);
++    gtk_box_pack_start(GTK_BOX(row), button, FALSE, FALSE, 0);
++    gtk_box_pack_start(GTK_BOX(view->root), row, FALSE, FALSE, 0);
++    GtkWidget *options = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 24);
++    view->dx = gtk_check_button_new_with_label("DX / 整屏 H.264");
++    gtk_widget_set_tooltip_text(view->dx, "仅用于已配置整屏 H.264 的服务器");
++    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(view->dx), dx);
++    view->low_latency = gtk_check_button_new_with_label("低延迟（优先操作）");
++    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(view->low_latency),
++        g_strcmp0(g_getenv("SPICE_DX_LOW_LATENCY"), "0") != 0);
++    gtk_widget_set_tooltip_text(view->low_latency,
++        "立即显示解码后的画面，音频可能稍晚。关闭后按媒体时钟等待，以优先保持音画同步。");
++    g_object_bind_property(view->dx, "active", view->low_latency, "sensitive", G_BINDING_SYNC_CREATE);
++    view->fullscreen = gtk_check_button_new_with_label("全屏打开");
++    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(view->fullscreen), fullscreen);
++    gtk_box_pack_start(GTK_BOX(options), view->dx, FALSE, FALSE, 0);
++    gtk_box_pack_start(GTK_BOX(options), view->low_latency, FALSE, FALSE, 0);
++    gtk_box_pack_start(GTK_BOX(options), view->fullscreen, FALSE, FALSE, 0);
++    gtk_box_pack_start(GTK_BOX(view->root), options, FALSE, FALSE, 0);
++    GtkWidget *heading = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
++    view->count = text_label("最近连接", "history-section");
++    gtk_box_pack_start(GTK_BOX(heading), view->count, TRUE, TRUE, 0);
++    view->clear = gtk_button_new_with_label("清空历史");
++    gtk_style_context_add_class(gtk_widget_get_style_context(view->clear), "history-remove");
++    g_signal_connect(view->clear, "clicked", G_CALLBACK(clear_history), view);
++    gtk_box_pack_end(GTK_BOX(heading), view->clear, FALSE, FALSE, 0);
++    gtk_box_pack_start(GTK_BOX(view->root), heading, FALSE, FALSE, 0);
++    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
++    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
++    gtk_widget_set_vexpand(scroll, TRUE);
++    gtk_widget_set_size_request(scroll, -1, 300);
++    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
++    view->flow = gtk_flow_box_new();
++    gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(view->flow), GTK_SELECTION_NONE);
++    gtk_flow_box_set_min_children_per_line(GTK_FLOW_BOX(view->flow), 1);
++    gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(view->flow), 3);
++    gtk_flow_box_set_row_spacing(GTK_FLOW_BOX(view->flow), 16);
++    gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(view->flow), 16);
++    gtk_widget_set_valign(view->flow, GTK_ALIGN_START);
++    gtk_box_pack_start(GTK_BOX(content), view->flow, FALSE, FALSE, 0);
++    view->empty = gtk_label_new("还没有连接记录\n成功连接后，桌面预览会显示在这里。");
++    gtk_style_context_add_class(gtk_widget_get_style_context(view->empty), "history-muted");
++    gtk_widget_set_margin_top(view->empty, 56);
++    gtk_widget_set_no_show_all(view->empty, TRUE);
++    gtk_box_pack_start(GTK_BOX(content), view->empty, FALSE, FALSE, 0);
++    gtk_container_add(GTK_CONTAINER(scroll), content);
++    gtk_box_pack_start(GTK_BOX(view->root), scroll, TRUE, TRUE, 0);
++    gtk_box_pack_start(GTK_BOX(view->root), text_label("历史和桌面缩略图仅保存在本机 · 最多保留 50 台桌面", "history-muted"), FALSE, FALSE, 0);
++    refresh_view(view);
++    return view->root;
++}
+diff --git a/src/connection-history.h b/src/connection-history.h
+new file mode 100644
+index 0000000..74e29cd
+--- /dev/null
++++ b/src/connection-history.h
+@@ -0,0 +1,11 @@
++/* Local connection history. SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <gtk/gtk.h>
++
++typedef void (*ClientHistoryConnect)(const gchar *uri, gboolean dx,
++                                     gboolean low_latency, gboolean fullscreen, gpointer user_data);
++gchar *client_history_normalize_uri(const gchar *input, GError **error);
++GtkWidget *client_history_view_new(ClientHistoryConnect connect, gpointer user_data,
++                                  gboolean dx, gboolean fullscreen);
++void client_history_record(const gchar *uri, const gchar *name, gboolean dx,
++                           gint64 connected_at, GdkPixbuf *desktop, gboolean first);
+diff --git a/src/display-layout.c b/src/display-layout.c
+new file mode 100644
+index 0000000..ba0b9c7
+--- /dev/null
++++ b/src/display-layout.c
+@@ -0,0 +1,383 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "display-layout.h"
++#include <json-glib/json-glib.h>
++#include <string.h>
++
++struct _DisplayLayout {
++    GObject parent;
++    SpiceSession *session;
++    SpicePortChannel *port;
++    GString *incoming;
++    GArray *monitors;
++    GtkWidget *dialog, *status, *list, *add, *editor, *width, *height, *automatic;
++    gint editing_id, pending_width[4], pending_height[4];
++    guint sequence, inflight, timeout, resize_timer;
++    gboolean opened, reveal;
++};
++G_DEFINE_TYPE(DisplayLayout, display_layout, G_TYPE_OBJECT)
++static guint changed_signal;
++static void refresh_list(DisplayLayout *self);
++static void queue_resize(DisplayLayout *self);
++
++static void display_layout_dispose(GObject *object) {
++    DisplayLayout *self = DISPLAY_LAYOUT(object);
++    if (self->timeout) { g_source_remove(self->timeout); self->timeout = 0; }
++    if (self->resize_timer) { g_source_remove(self->resize_timer); self->resize_timer = 0; }
++    if (self->dialog) gtk_widget_destroy(self->dialog);
++    g_clear_object(&self->port);
++    g_clear_object(&self->session);
++    G_OBJECT_CLASS(display_layout_parent_class)->dispose(object);
++}
++static void display_layout_finalize(GObject *object) {
++    DisplayLayout *self = DISPLAY_LAYOUT(object);
++    g_string_free(self->incoming, TRUE);
++    g_array_unref(self->monitors);
++    G_OBJECT_CLASS(display_layout_parent_class)->finalize(object);
++}
++static void display_layout_class_init(DisplayLayoutClass *klass) {
++    GObjectClass *object = G_OBJECT_CLASS(klass);
++    object->dispose = display_layout_dispose;
++    object->finalize = display_layout_finalize;
++    changed_signal = g_signal_new("changed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST,
++                                  0, NULL, NULL, NULL, G_TYPE_NONE, 0);
++}
++static void display_layout_init(DisplayLayout *self) {
++    self->incoming = g_string_new(NULL);
++    self->monitors = g_array_new(FALSE, TRUE, sizeof(RemoteMonitor));
++}
++static void set_status(DisplayLayout *self, const gchar *message) {
++    if (self->status) gtk_label_set_text(GTK_LABEL(self->status), message);
++    g_message("Displays: %s", message);
++}
++static const RemoteMonitor *find_monitor(DisplayLayout *self, gint id) {
++    for (guint i = 0; i < self->monitors->len; i++) {
++        const RemoteMonitor *m = &g_array_index(self->monitors, RemoteMonitor, i);
++        if (m->id == id) return m;
++    }
++    return NULL;
++}
++static void complete_request(DisplayLayout *self) {
++    self->inflight = 0;
++    if (self->timeout) { g_source_remove(self->timeout); self->timeout = 0; }
++}
++static gboolean request_timeout(gpointer data) {
++    DisplayLayout *self = data;
++    self->timeout = 0;
++    self->inflight = 0;
++    set_status(self, "显示配置响应超时，请检查远程显示服务。");
++    refresh_list(self);
++    return G_SOURCE_REMOVE;
++}
++static void write_done(GObject *port, GAsyncResult *result, gpointer data) {
++    GError *error = NULL;
++    if (spice_port_channel_write_finish(SPICE_PORT_CHANNEL(port), result, &error) < 0) {
++        g_warning("Display configuration write failed: %s", error->message);
++        g_clear_error(&error);
++    }
++    g_free(data);
++}
++static gboolean send_request(DisplayLayout *self, const gchar *body) {
++    if (!self->opened || !self->port) {
++        set_status(self, "远程显示服务尚未连接。");
++        return FALSE;
++    }
++    if (self->inflight) return FALSE;
++    self->sequence = self->sequence % 2147483646 + 1;
++    self->inflight = self->sequence;
++    gchar *request = g_strdup_printf("{\"version\":2,\"request_id\":%u,%s}\n", self->sequence, body);
++    spice_port_channel_write_async(self->port, request, strlen(request), NULL, write_done, request);
++    self->timeout = g_timeout_add_seconds(12, request_timeout, self);
++    refresh_list(self);
++    return TRUE;
++}
++static gboolean integer_member(JsonObject *object, const gchar *name, gint *value) {
++    JsonNode *node = json_object_get_member(object, name);
++    if (!node || json_node_get_value_type(node) != G_TYPE_INT64) return FALSE;
++    gint64 number = json_node_get_int(node);
++    if (number < 0 || number > 8192) return FALSE;
++    *value = number;
++    return TRUE;
++}
++static void receive_line(DisplayLayout *self, const gchar *line) {
++    g_autoptr(JsonParser) parser = json_parser_new();
++    if (!json_parser_load_from_data(parser, line, -1, NULL)) return;
++    JsonNode *root = json_parser_get_root(parser);
++    if (!JSON_NODE_HOLDS_OBJECT(root)) return;
++    JsonObject *object = json_node_get_object(root);
++    if (json_object_get_int_member_with_default(object, "version", 0) != 2) {
++        set_status(self, "远程显示服务需要更新。");
++        return;
++    }
++    if (self->inflight && json_object_get_int_member_with_default(object, "request_id", 0) == self->inflight)
++        complete_request(self);
++    const gchar *type = json_object_get_string_member_with_default(object, "type", "");
++    if (g_str_equal(type, "error")) {
++        set_status(self, json_object_get_string_member_with_default(object, "message", "显示配置失败"));
++        refresh_list(self);
++        queue_resize(self);
++        return;
++    }
++    if (!g_str_equal(type, "state") || !json_object_has_member(object, "monitors")) return;
++    JsonNode *node = json_object_get_member(object, "monitors");
++    if (!JSON_NODE_HOLDS_ARRAY(node)) return;
++    JsonArray *array = json_node_get_array(node);
++    guint count = json_array_get_length(array), ids = 0;
++    if (!count || count > 4) return;
++    GArray *monitors = g_array_new(FALSE, TRUE, sizeof(RemoteMonitor));
++    for (guint i = 0; i < count; i++) {
++        node = json_array_get_element(array, i);
++        if (!JSON_NODE_HOLDS_OBJECT(node)) goto invalid;
++        JsonObject *m = json_node_get_object(node);
++        RemoteMonitor monitor = {0};
++        if (!integer_member(m, "id", &monitor.id) || monitor.id > 3 || (ids & (1 << monitor.id)) ||
++            !integer_member(m, "x", &monitor.x) || !integer_member(m, "y", &monitor.y) ||
++            !integer_member(m, "width", &monitor.width) || !integer_member(m, "height", &monitor.height) ||
++            !integer_member(m, "input_id", &monitor.input_id) || monitor.input_id > 255 ||
++            monitor.width < 1 || monitor.height < 1 || monitor.x + monitor.width > 8192 ||
++            monitor.y + monitor.height > 8192) goto invalid;
++        JsonNode *automatic = json_object_get_member(m, "auto_resize");
++        if (!automatic || json_node_get_value_type(automatic) != G_TYPE_BOOLEAN) goto invalid;
++        monitor.auto_resize = json_node_get_boolean(automatic);
++        ids |= 1 << monitor.id;
++        g_array_append_val(monitors, monitor);
++    }
++    gboolean changed = monitors->len != self->monitors->len ||
++        memcmp(monitors->data, self->monitors->data, monitors->len * sizeof(RemoteMonitor));
++    g_array_unref(self->monitors);
++    self->monitors = monitors;
++    for (gint id = 0; id < 4; id++) {
++        const RemoteMonitor *m = find_monitor(self, id);
++        if (!m || !m->auto_resize ||
++            (m->width == self->pending_width[id] && m->height == self->pending_height[id]))
++            self->pending_width[id] = self->pending_height[id] = 0;
++    }
++    gchar *message = g_strdup_printf("已连接 %u 块显示器。", count);
++    set_status(self, message);
++    g_free(message);
++    refresh_list(self);
++    if (changed) g_signal_emit(self, changed_signal, 0);
++    queue_resize(self);
++    return;
++invalid:
++    g_array_unref(monitors);
++}
++static void port_data(SpicePortChannel *port, gpointer data, gint size, DisplayLayout *self) {
++    if (size <= 0 || size > 8192 || self->incoming->len + size > 16384) {
++        g_string_truncate(self->incoming, 0);
++        return;
++    }
++    g_string_append_len(self->incoming, data, size);
++    gchar *end;
++    while ((end = strchr(self->incoming->str, '\n'))) {
++        gsize length = end - self->incoming->str;
++        gchar *line = g_strndup(self->incoming->str, length);
++        g_string_erase(self->incoming, 0, length + 1);
++        receive_line(self, line);
++        g_free(line);
++    }
++}
++static void port_opened(SpiceChannel *port, GParamSpec *spec, DisplayLayout *self) {
++    g_object_get(port, "port-opened", &self->opened, NULL);
++    g_string_truncate(self->incoming, 0);
++    complete_request(self);
++    if (self->opened) send_request(self, "\"op\":\"query\"");
++    else { set_status(self, "远程显示服务已断开。"); refresh_list(self); }
++}
++static void port_name(SpiceChannel *port, GParamSpec *spec, DisplayLayout *self) {
++    gchar *name = NULL;
++    g_object_get(port, "port-name", &name, NULL);
++    if (g_strcmp0(name, "org.spice-space.displays.0") == 0 && !self->port) {
++        self->port = g_object_ref(SPICE_PORT_CHANNEL(port));
++        g_signal_connect_object(port, "port-data", G_CALLBACK(port_data), self, 0);
++        g_signal_connect_object(port, "notify::port-opened", G_CALLBACK(port_opened), self, 0);
++        port_opened(port, NULL, self);
++    }
++    g_free(name);
++}
++static void channel_new(SpiceSession *session, SpiceChannel *channel, DisplayLayout *self) {
++    if (!SPICE_IS_PORT_CHANNEL(channel)) return;
++    g_signal_connect_object(channel, "notify::port-name", G_CALLBACK(port_name), self, 0);
++    port_name(channel, NULL, self);
++}
++DisplayLayout *display_layout_new(ClientConn *conn) {
++    DisplayLayout *self = g_object_new(DISPLAY_TYPE_LAYOUT, NULL);
++    self->session = g_object_ref(client_conn_get_session(conn));
++    g_signal_connect_object(self->session, "channel-new", G_CALLBACK(channel_new), self, 0);
++    return self;
++}
++const GArray *display_layout_get_monitors(DisplayLayout *self) { return self ? self->monitors : NULL; }
++gboolean display_layout_should_reveal(DisplayLayout *self) { return self && self->reveal; }
++
++static gboolean resize_pending(gpointer data) {
++    DisplayLayout *self = data;
++    if (self->inflight || self->dialog) return G_SOURCE_CONTINUE;
++    self->resize_timer = 0;
++    for (gint id = 0; id < 4; id++) {
++        const RemoteMonitor *m = find_monitor(self, id);
++        gint w = self->pending_width[id], h = self->pending_height[id];
++        if (!w) continue;
++        self->pending_width[id] = self->pending_height[id] = 0;
++        if (!m || !m->auto_resize || (w == m->width && h == m->height)) continue;
++        gchar *body = g_strdup_printf("\"op\":\"resize\",\"id\":%d,\"width\":%d,\"height\":%d", id, w, h);
++        send_request(self, body);
++        g_free(body);
++        break;
++    }
++    queue_resize(self);
++    return G_SOURCE_REMOVE;
++}
++static void queue_resize(DisplayLayout *self) {
++    if (self->resize_timer || !self->opened) return;
++    for (gint id = 0; id < 4; id++) if (self->pending_width[id]) {
++        self->resize_timer = g_timeout_add(400, resize_pending, self);
++        break;
++    }
++}
++void display_layout_resize(DisplayLayout *self, gint id, gint width, gint height) {
++    if (!self || id < 0 || id > 3 || width < 320 || height < 200) return;
++    const RemoteMonitor *m = find_monitor(self, id);
++    if (!m || !m->auto_resize) return;
++    self->pending_width[id] = (MIN(width, 3840) + 1) & ~1;
++    self->pending_height[id] = (MIN(height, 2160) + 1) & ~1;
++    if (self->resize_timer) { g_source_remove(self->resize_timer); self->resize_timer = 0; }
++    queue_resize(self);
++}
++static void append_monitor(GString *body, gint id, gint w, gint h, gboolean automatic, gboolean *comma) {
++    g_string_append_printf(body, "%s{\"id\":%d,\"width\":%d,\"height\":%d,\"auto_resize\":%s}",
++                           *comma ? "," : "", id, w, h, automatic ? "true" : "false");
++    *comma = TRUE;
++}
++static void edit_configuration(DisplayLayout *self, gint id, gint w, gint h, gboolean automatic, gboolean remove) {
++    if (self->inflight) return;
++    GString *body = g_string_new("\"op\":\"configure\",\"monitors\":[");
++    gboolean comma = FALSE;
++    for (guint i = 0; i < self->monitors->len; i++) {
++        const RemoteMonitor *m = &g_array_index(self->monitors, RemoteMonitor, i);
++        if (m->id != id) append_monitor(body, m->id, m->width, m->height, m->auto_resize, &comma);
++    }
++    if (!remove) append_monitor(body, id, w, h, automatic, &comma);
++    g_string_append_c(body, ']');
++    memset(self->pending_width, 0, sizeof(self->pending_width));
++    memset(self->pending_height, 0, sizeof(self->pending_height));
++    set_status(self, "正在应用显示器设置…");
++    send_request(self, body->str);
++    g_string_free(body, TRUE);
++}
++static void editor_destroy(GtkWidget *editor, DisplayLayout *self) {
++    self->editor = self->width = self->height = self->automatic = NULL;
++}
++static void editor_response(GtkDialog *editor, gint response, DisplayLayout *self) {
++    if (response == GTK_RESPONSE_APPLY) {
++        gtk_spin_button_update(GTK_SPIN_BUTTON(self->width));
++        gtk_spin_button_update(GTK_SPIN_BUTTON(self->height));
++        edit_configuration(self, self->editing_id,
++            gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(self->width)),
++            gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(self->height)),
++            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->automatic)), FALSE);
++    }
++    gtk_widget_destroy(GTK_WIDGET(editor));
++}
++static void open_editor(DisplayLayout *self, gint id) {
++    if (self->editor || self->inflight || !self->dialog) return;
++    const RemoteMonitor *m = find_monitor(self, id);
++    self->editing_id = id;
++    self->editor = gtk_dialog_new_with_buttons(m ? "修改显示器" : "添加显示器", GTK_WINDOW(self->dialog),
++        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, "取消", GTK_RESPONSE_CANCEL,
++        m ? "应用修改" : "添加", GTK_RESPONSE_APPLY, NULL);
++    GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(self->editor));
++    gtk_container_set_border_width(GTK_CONTAINER(box), 20);
++    gtk_box_set_spacing(GTK_BOX(box), 14);
++    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
++    gtk_box_pack_start(GTK_BOX(box), row, FALSE, FALSE, 0);
++    gtk_box_pack_start(GTK_BOX(row), gtk_label_new("分辨率"), FALSE, FALSE, 0);
++    self->width = gtk_spin_button_new_with_range(320, 3840, 2);
++    self->height = gtk_spin_button_new_with_range(200, 2160, 2);
++    gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->width), m ? m->width : 1280);
++    gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->height), m ? m->height : 720);
++    gtk_box_pack_start(GTK_BOX(row), self->width, FALSE, FALSE, 0);
++    gtk_box_pack_start(GTK_BOX(row), gtk_label_new("×"), FALSE, FALSE, 0);
++    gtk_box_pack_start(GTK_BOX(row), self->height, FALSE, FALSE, 0);
++    self->automatic = gtk_check_button_new_with_label("拉伸窗口时自动调整此屏幕分辨率");
++    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->automatic), m ? m->auto_resize : TRUE);
++    gtk_box_pack_start(GTK_BOX(box), self->automatic, FALSE, FALSE, 0);
++    gtk_box_pack_start(GTK_BOX(box), gtk_label_new("支持自定义尺寸，按 2 像素对齐。"), FALSE, FALSE, 0);
++    g_signal_connect(self->editor, "destroy", G_CALLBACK(editor_destroy), self);
++    g_signal_connect(self->editor, "response", G_CALLBACK(editor_response), self);
++    gtk_widget_show_all(self->editor);
++}
++static void edit_clicked(GtkButton *button, DisplayLayout *self) {
++    open_editor(self, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "monitor-id")));
++}
++static void remove_clicked(GtkButton *button, DisplayLayout *self) {
++    if (self->monitors->len <= 1 || self->inflight) return;
++    edit_configuration(self, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "monitor-id")), 0, 0, FALSE, TRUE);
++}
++static void add_clicked(GtkButton *button, DisplayLayout *self) {
++    for (gint id = 0; id < 4; id++) if (!find_monitor(self, id)) { open_editor(self, id); break; }
++}
++static void refresh_list(DisplayLayout *self) {
++    if (!self->list) return;
++    GList *children = gtk_container_get_children(GTK_CONTAINER(self->list));
++    for (GList *p = children; p; p = p->next) gtk_widget_destroy(p->data);
++    g_list_free(children);
++    for (guint i = 0; i < self->monitors->len; i++) {
++        const RemoteMonitor *m = &g_array_index(self->monitors, RemoteMonitor, i);
++        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
++        gtk_container_set_border_width(GTK_CONTAINER(row), 12);
++        gchar *text = g_strdup_printf("显示器 %d%s\n%d × %d  ·  %s", m->id + 1,
++            i == 0 ? "（主屏）" : "", m->width, m->height,
++            m->auto_resize ? "随窗口调整" : "固定分辨率");
++        GtkWidget *label = gtk_label_new(text);
++        g_free(text);
++        gtk_label_set_xalign(GTK_LABEL(label), 0);
++        gtk_box_pack_start(GTK_BOX(row), label, TRUE, TRUE, 0);
++        GtkWidget *edit = gtk_button_new_with_label("修改");
++        GtkWidget *remove = gtk_button_new_with_label("删除");
++        g_object_set_data(G_OBJECT(edit), "monitor-id", GINT_TO_POINTER(m->id));
++        g_object_set_data(G_OBJECT(remove), "monitor-id", GINT_TO_POINTER(m->id));
++        g_signal_connect(edit, "clicked", G_CALLBACK(edit_clicked), self);
++        g_signal_connect(remove, "clicked", G_CALLBACK(remove_clicked), self);
++        gtk_widget_set_sensitive(edit, self->opened && !self->inflight);
++        gtk_widget_set_sensitive(remove, self->opened && !self->inflight && self->monitors->len > 1);
++        gtk_box_pack_start(GTK_BOX(row), edit, FALSE, FALSE, 0);
++        gtk_box_pack_start(GTK_BOX(row), remove, FALSE, FALSE, 0);
++        gtk_container_add(GTK_CONTAINER(self->list), row);
++    }
++    gtk_widget_set_sensitive(self->add, self->opened && !self->inflight && self->monitors->len < 4);
++    gtk_widget_show_all(self->list);
++}
++static void dialog_destroy(GtkWidget *dialog, DisplayLayout *self) {
++    self->dialog = self->status = self->list = self->add = NULL;
++}
++static void dialog_response(GtkDialog *dialog, gint response, DisplayLayout *self) {
++    if (response == 1) {
++        self->reveal = TRUE;
++        g_signal_emit(self, changed_signal, 0);
++        self->reveal = FALSE;
++    } else gtk_widget_destroy(GTK_WIDGET(dialog));
++}
++void display_layout_show(DisplayLayout *self, GtkWindow *parent) {
++    if (self->dialog) { gtk_window_present(GTK_WINDOW(self->dialog)); return; }
++    self->dialog = gtk_dialog_new_with_buttons("远程显示器", parent,
++        GTK_DIALOG_DESTROY_WITH_PARENT | GTK_DIALOG_MODAL,
++        "显示所有窗口", 1, "关闭", GTK_RESPONSE_CLOSE, NULL);
++    gtk_window_set_default_size(GTK_WINDOW(self->dialog), 570, 340);
++    GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(self->dialog));
++    gtk_container_set_border_width(GTK_CONTAINER(box), 18);
++    gtk_box_set_spacing(GTK_BOX(box), 12);
++    gtk_box_pack_start(GTK_BOX(box), gtk_label_new("每块显示器使用独立窗口，可分别设置分辨率。"), FALSE, FALSE, 0);
++    self->list = gtk_list_box_new();
++    gtk_list_box_set_selection_mode(GTK_LIST_BOX(self->list), GTK_SELECTION_NONE);
++    gtk_box_pack_start(GTK_BOX(box), self->list, TRUE, TRUE, 0);
++    self->add = gtk_button_new_with_label("＋ 添加显示器");
++    gtk_widget_set_halign(self->add, GTK_ALIGN_START);
++    gtk_box_pack_start(GTK_BOX(box), self->add, FALSE, FALSE, 0);
++    g_signal_connect(self->add, "clicked", G_CALLBACK(add_clicked), self);
++    self->status = gtk_label_new(self->opened ? "最多支持 4 块显示器。" : "等待远程显示服务连接…");
++    gtk_label_set_line_wrap(GTK_LABEL(self->status), TRUE);
++    gtk_box_pack_start(GTK_BOX(box), self->status, FALSE, FALSE, 0);
++    g_signal_connect(self->dialog, "destroy", G_CALLBACK(dialog_destroy), self);
++    g_signal_connect(self->dialog, "response", G_CALLBACK(dialog_response), self);
++    refresh_list(self);
++    gtk_widget_show_all(self->dialog);
++}
+diff --git a/src/display-layout.h b/src/display-layout.h
+new file mode 100644
+index 0000000..a7ce217
+--- /dev/null
++++ b/src/display-layout.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include "client-conn.h"
++#include <gtk/gtk.h>
++
++#define DISPLAY_TYPE_LAYOUT (display_layout_get_type())
++G_DECLARE_FINAL_TYPE(DisplayLayout, display_layout, DISPLAY, LAYOUT, GObject)
++typedef struct { gint x, y, width, height, input_id, id; gboolean auto_resize; } RemoteMonitor;
++DisplayLayout *display_layout_new(ClientConn *conn);
++const GArray *display_layout_get_monitors(DisplayLayout *layout);
++void display_layout_show(DisplayLayout *layout, GtkWindow *parent);
++gboolean display_layout_should_reveal(DisplayLayout *layout);
++void display_layout_resize(DisplayLayout *layout, gint id, gint width, gint height);
+diff --git a/src/spice-win.c b/src/spice-win.c
+index 799b668..459b21a 100644
+--- a/src/spice-win.c
++++ b/src/spice-win.c
+@@ -21,6 +21,7 @@
+ #include "flexvdi-port.h"
+ #include "printclient.h"
+ #include "about.h"
++#include "connection-history.h"
+ 
+ #ifdef __APPLE__
+ #include <gdk/gdkquartz.h>
+@@ -67,6 +68,13 @@ struct _SpiceWindow {
+     GtkToolButton * about_button;
+     guint notification_timeout_id;
+     gulong channel_event_handler_id;
++    guint history_source;
++    gint64 history_connected_at, history_last_capture;
++    gboolean history_saved;
++    DisplayLayout *layout;
++    gboolean is_primary, has_remote_monitor;
++    gint allocation_width, allocation_height;
++    gint64 resize_suppressed_until;
+ };
+ 
+ enum {
+@@ -191,6 +199,8 @@ static void spice_window_init(SpiceWindow * win) {
+ 
+ static void spice_window_dispose(GObject * obj) {
+     SpiceWindow * win = SPICE_WIN(obj);
++    g_clear_object(&win->layout);
++    if (win->history_source) { g_source_remove(win->history_source); win->history_source = 0; }
+     g_clear_object(&win->conn);
+     g_clear_object(&win->conf);
+     if (win->display_channel)
+@@ -216,6 +226,35 @@ static gboolean leave_window_cb(GtkWidget * widget, GdkEventCrossing * event,
+ static void mouse_grab_cb(SpiceDisplay * display, gint status, gpointer user_data);
+ static void spice_size_allocate(GtkWidget * widget, GdkRectangle * a, gpointer user_data);
+ 
++void spice_window_save_history(SpiceWindow *win) {
++    if (!win->conf || !win->display_channel || !win->is_primary || !win->spice) return;
++    const gchar *uri = client_conf_get_uri(win->conf);
++    if (!uri) return;
++    SpiceDisplayPrimary primary;
++    if (!spice_display_channel_get_primary(win->display_channel, 0, &primary) ||
++        !primary.data || primary.width <= 0 || primary.height <= 0 ||
++        (primary.format != SPICE_SURFACE_FMT_32_xRGB && primary.format != SPICE_SURFACE_FMT_32_ARGB)) return;
++    gboolean ready = FALSE;
++    g_object_get(win->spice, "ready", &ready, NULL);
++    if (!ready) return;
++    gboolean dx = client_conn_selected_display() == 1;
++    if (dx && g_strcmp0(g_object_get_data(G_OBJECT(win->display_channel), "dx-video-status"), "H.264 decoded")) return;
++    g_autoptr(GdkPixbuf) desktop = spice_display_get_pixbuf(win->spice);
++    if (!desktop) return;
++    g_autofree gchar *name = NULL;
++    g_object_get(client_conn_get_session(win->conn), "name", &name, NULL);
++    client_history_record(uri, name, dx, win->history_connected_at, desktop, !win->history_saved);
++    win->history_saved = TRUE;
++    win->history_last_capture = g_get_monotonic_time();
++}
++
++static gboolean history_capture(gpointer data) {
++    SpiceWindow *win = SPICE_WIN(data);
++    if (!win->history_saved || g_get_monotonic_time() - win->history_last_capture >= 30 * G_USEC_PER_SEC)
++        spice_window_save_history(win);
++    return G_SOURCE_CONTINUE;
++}
++
+ void usb_connect_failed(GObject * object, SpiceUsbDevice * device,
+                         GError * error, gpointer user_data);
+ 
+@@ -233,7 +272,10 @@ SpiceWindow * spice_window_new(ClientConn * conn, SpiceChannel * channel,
+ 
+     /* spice display */
+     SpiceSession * session = client_conn_get_session(conn);
+-    win->spice = spice_display_new_with_monitor(session, 0, id);
++    gint channel_id;
++    g_object_get(channel, "channel-id", &channel_id, NULL);
++    win->spice = spice_display_new_with_monitor(session, channel_id,
++        g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0 ? 0 : id);
+     gtk_box_pack_end(win->content_box, GTK_WIDGET(win->spice), TRUE, TRUE, 0);
+     gtk_widget_grab_focus(GTK_WIDGET(win->spice));
+ 
+@@ -326,9 +368,60 @@ SpiceWindow * spice_window_new(ClientConn * conn, SpiceChannel * channel,
+             break;
+     }
+ 
++    if (id == 0 && client_conf_get_uri(conf)) {
++        win->is_primary = TRUE;
++        win->history_connected_at = g_get_real_time() / G_USEC_PER_SEC;
++        win->history_source = g_timeout_add_seconds(3, history_capture, win);
++    }
+     return win;
+ }
+ 
++void spice_window_set_remote_monitor(SpiceWindow *win, const RemoteMonitor *monitor) {
++    if (monitor && !win->has_remote_monitor) {
++        win->has_remote_monitor = TRUE;
++        win->resize_suppressed_until = g_get_monotonic_time() + G_USEC_PER_SEC;
++        GtkAllocation allocation;
++        gtk_widget_get_allocation(GTK_WIDGET(win->spice), &allocation);
++        win->allocation_width = allocation.width;
++        win->allocation_height = allocation.height;
++    }
++    win->is_primary = monitor && monitor->x == 0 && monitor->y == 0;
++    if (win->is_primary && !win->history_source && client_conf_get_uri(win->conf)) {
++        win->history_connected_at = g_get_real_time() / G_USEC_PER_SEC;
++        win->history_source = g_timeout_add_seconds(3, history_capture, win);
++    } else if (!win->is_primary && win->history_source) {
++        g_source_remove(win->history_source);
++        win->history_source = 0;
++    }
++    GVariant *region = monitor ? g_variant_ref_sink(g_variant_new("(iiiii)",
++        monitor->x, monitor->y, monitor->width, monitor->height, monitor->input_id)) : NULL;
++    g_object_set(win->spice, "remote-monitor", region, NULL);
++    if (region) g_variant_unref(region);
++}
++
++void spice_window_start_windowed(SpiceWindow *win) {
++    win->initially_fullscreen = FALSE;
++    win->maximized = FALSE;
++    gtk_window_unfullscreen(GTK_WINDOW(win));
++    gtk_window_unmaximize(GTK_WINDOW(win));
++    gtk_window_resize(GTK_WINDOW(win), 960, 640);
++}
++
++static void displays_clicked(GtkToolButton *button, DisplayLayout *layout) {
++    GtkWidget *top = gtk_widget_get_toplevel(GTK_WIDGET(button));
++    if (GTK_IS_WINDOW(top)) display_layout_show(layout, GTK_WINDOW(top));
++}
++
++void spice_window_add_displays_button(SpiceWindow *win, DisplayLayout *layout) {
++    g_set_object(&win->layout, layout);
++    GtkToolItem *button = gtk_tool_button_new(NULL, "显示器");
++    gtk_tool_button_set_icon_name(GTK_TOOL_BUTTON(button), "video-display-symbolic");
++    gtk_widget_set_tooltip_text(GTK_WIDGET(button), "创建显示器 / 显示全部窗口");
++    gtk_toolbar_insert(win->toolbar, button, -1);
++    g_signal_connect_object(button, "clicked", G_CALLBACK(displays_clicked), layout, 0);
++    gtk_widget_show(GTK_WIDGET(button));
++}
++
+ static void set_printers_menu_visibility(gpointer user_data) {
+     SpiceWindow * win = SPICE_WIN(user_data);
+     FlexvdiPort * guest_port = client_conn_get_guest_agent_port(win->conn);
+@@ -400,6 +493,15 @@ static gboolean configure_event(GtkWidget * widget, GdkEvent * event, gpointer u
+ static void spice_size_allocate(GtkWidget * widget, GdkRectangle * a, gpointer user_data) {
+     SpiceWindow * win = SPICE_WIN(user_data);
+ 
++    gboolean changed = a->width != win->allocation_width || a->height != win->allocation_height;
++    win->allocation_width = a->width;
++    win->allocation_height = a->height;
++    if (changed && win->layout && win->has_remote_monitor &&
++        g_get_monotonic_time() > win->resize_suppressed_until && gtk_widget_get_mapped(widget)) {
++        gint scale = gtk_widget_get_scale_factor(widget);
++        display_layout_resize(win->layout, win->id, a->width * scale, a->height * scale);
++    }
++
+     // Save the window geometry only if we are not maximized or fullscreen.
+     if (!(win->maximized || win->fullscreen)) {
+         gtk_window_get_size(GTK_WINDOW(win), &win->width, &win->height);
+diff --git a/src/spice-win.h b/src/spice-win.h
+index eb56af8..9b0473f 100644
+--- a/src/spice-win.h
++++ b/src/spice-win.h
+@@ -24,10 +24,12 @@
+ #include <spice-client-gtk.h>
+ #include "client-conn.h"
+ #include "configuration.h"
++#include "display-layout.h"
+ 
+ 
+ #define SPICE_WIN_TYPE (spice_window_get_type())
+ G_DECLARE_FINAL_TYPE(SpiceWindow, spice_window, SPICE, WIN, GtkApplicationWindow)
++void spice_window_start_windowed(SpiceWindow *win);
+ 
+ SpiceWindow * spice_window_new(ClientConn * conn, SpiceChannel * channel,
+                                ClientConf * conf, int id, gchar * title);
+@@ -36,5 +38,8 @@ void spice_win_show_notification(SpiceWindow * win, const gchar * text, gint dur
+ void spice_win_release_mouse_pointer(SpiceWindow * win);
+ int spice_window_get_monitor(SpiceWindow * win);
+ void spice_window_enable_grabbing(SpiceWindow * win, gboolean enable);
++void spice_window_save_history(SpiceWindow *win);
++void spice_window_set_remote_monitor(SpiceWindow *win, const RemoteMonitor *monitor);
++void spice_window_add_displays_button(SpiceWindow *win, DisplayLayout *layout);
+ 
+ #endif /* _SPICE_WIN_H */

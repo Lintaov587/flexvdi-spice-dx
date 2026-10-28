@@ -460,3 +460,27 @@ gchar * client_app_window_get_desktop(ClientAppWindow * win) {
 void client_app_window_hide_config_button(ClientAppWindow * win) {
     gtk_widget_hide(GTK_WIDGET(win->config));
 }
+
+void client_app_window_show_history(ClientAppWindow *win, ClientHistoryConnect connect,
+                                    gpointer user_data, gboolean dx, gboolean fullscreen) {
+    GtkWidget *old = gtk_stack_get_child_by_name(win->stack, "history");
+    if (old) gtk_widget_destroy(old);
+    GtkWidget *home = client_history_view_new(connect, user_data, dx, fullscreen);
+    gtk_stack_add_named(win->stack, home, "history");
+    gtk_stack_set_homogeneous(win->stack, FALSE);
+    gtk_widget_set_margin_start(GTK_WIDGET(win->stack), 28);
+    gtk_widget_set_margin_end(GTK_WIDGET(win->stack), 28);
+    gtk_widget_set_margin_bottom(GTK_WIDGET(win->stack), 16);
+    gtk_widget_set_valign(GTK_WIDGET(win->stack), GTK_ALIGN_FILL);
+    gtk_window_set_title(GTK_WINDOW(win), "SPICE 连接中心");
+    gtk_window_set_resizable(GTK_WINDOW(win), TRUE);
+    gtk_window_set_default_size(GTK_WINDOW(win), 960, 760);
+    if (!old) gtk_window_resize(GTK_WINDOW(win), 960, 760);
+    gtk_widget_show_all(GTK_WIDGET(win));
+    gtk_widget_hide(GTK_WIDGET(win->logo_client));
+    gtk_widget_hide(GTK_WIDGET(win->config));
+    gtk_label_set_text(win->info, "连接历史");
+    client_app_window_set_central_widget(win, "history");
+    client_app_window_set_central_widget_sensitive(win, TRUE);
+    gtk_window_present(GTK_WINDOW(win));
+}

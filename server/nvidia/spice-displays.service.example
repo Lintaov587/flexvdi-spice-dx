@@ -1,0 +1,21 @@
+[Unit]
+Description=SPICE virtual display configuration
+After=display-manager.service
+StartLimitIntervalSec=0
+
+[Service]
+User=YOUR_DESKTOP_USER
+SupplementaryGroups=video
+WorkingDirectory=/
+StateDirectory=spice-displays
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+ExecStart=/usr/bin/python3 /usr/local/libexec/spice-displays.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=graphical.target

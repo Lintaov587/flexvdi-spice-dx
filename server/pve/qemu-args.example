@@ -1,0 +1,6 @@
+# Append these arguments to the existing VM args; do not replace unrelated args.
+# Verify spice.0 exists and virtserialport slots 4 and 5 are unused.
+-chardev spiceport,id=dxstream,name=org.spice-space.stream.0
+-device virtserialport,id=dxstream,bus=spice.0,nr=4,chardev=dxstream,name=org.spice-space.stream.0
+-chardev spiceport,id=displayctl,name=org.spice-space.displays.0
+-device virtserialport,id=displayctl,bus=spice.0,nr=5,chardev=displayctl,name=org.spice-space.displays.0

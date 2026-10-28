@@ -1,0 +1,6 @@
+# Install as /etc/default/spice-fullscreen; match the logged-in X11 desktop.
+DESKTOP_UID=1000
+DESKTOP_GID=1000
+VIDEO_GID=44
+RENDER_GID=110
+XAUTHORITY_FILE=/run/user/1000/gdm/Xauthority

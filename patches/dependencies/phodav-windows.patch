@@ -1,0 +1,12 @@
+--- a/libphodav/meson.build
++++ b/libphodav/meson.build
+@@ -31,6 +31,9 @@
+ 
+ mapfile = 'libphodav.syms'
+ vflag = '-Wl,--version-script,@0@/@1@'.format(meson.current_source_dir(), mapfile)
++if host_machine.system() == 'windows'
++  vflag = []
++endif
+ 
+ libphodav = library(
+   'phodav-2.0',

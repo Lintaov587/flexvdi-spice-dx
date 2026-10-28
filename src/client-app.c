@@ -86,6 +86,10 @@ struct _ClientApp {
     gboolean autologin;
     gboolean grab_disabled;
     PrintJobManager * pjb;
+    gboolean history_mode;
+    guint inactivity_source, ungrab_source;
+    DisplayLayout *display_layout;
+    SpiceChannel *desktop_channel;
 };
 
 G_DEFINE_TYPE(ClientApp, client_app, GTK_TYPE_APPLICATION);
@@ -209,6 +213,31 @@ static void network_changed(GNetworkMonitor * net_monitor, gboolean network_avai
 static void client_app_configure(ClientApp * app, const gchar * error);
 static void client_app_show_login(ClientApp * app, const gchar * error);
 static void client_app_connect_with_spice_uri(ClientApp * app, const gchar * uri);
+static void history_connect(const gchar *uri, gboolean dx, gboolean low_latency, gboolean fullscreen, gpointer data);
+static void show_history(ClientApp *app) {
+    client_app_window_show_history(app->main_window, history_connect, app,
+        client_conn_selected_display() == 1, client_conf_get_fullscreen(app->conf));
+}
+
+static void history_connect(const gchar *uri, gboolean dx, gboolean low_latency, gboolean fullscreen, gpointer data) {
+    ClientApp *app = CLIENT_APP(data);
+    if (app->connection) return;
+    if (dx) {
+        GstElementFactory *decoder = gst_element_factory_find("d3d11h264dec");
+        if (!decoder) {
+            client_app_window_error(app->main_window, "此电脑无法使用 D3D11 H.264 硬解，请手动选择标准模式或检查显卡驱动。");
+            return;
+        }
+        gst_object_unref(decoder);
+    }
+    g_setenv("SPICE_DX_H264", dx ? "1" : "0", TRUE);
+    g_setenv("SPICE_DX_LOW_LATENCY", low_latency ? "1" : "0", TRUE);
+    client_conf_set_uri(app->conf, uri);
+    client_conf_set_fullscreen(app->conf, fullscreen);
+    client_app_window_status(app->main_window, "正在连接桌面...");
+    client_app_window_set_central_widget_sensitive(app->main_window, FALSE);
+    client_app_connect_with_spice_uri(app, client_conf_get_uri(app->conf));
+}
 
 static void about_activated(GSimpleAction * action, GVariant * parameter, gpointer gapp) {
     ClientApp * app = CLIENT_APP(gapp);
@@ -270,6 +299,12 @@ static void client_app_activate(GApplication * gapp) {
         G_CALLBACK(desktop_selected_handler), app);
     g_signal_connect(app->main_window, "delete-event",
         G_CALLBACK(delete_cb), app);
+
+    app->history_mode = client_conf_get_uri(app->conf) == NULL && !client_conf_get_kiosk_mode(app->conf);
+    if (app->history_mode) {
+        show_history(app);
+        return;
+    }
 
     GNetworkMonitor * net_monitor = g_network_monitor_get_default();
     g_debug("Using network monitor @0x%p, connectivity %d", net_monitor, g_network_monitor_get_connectivity(net_monitor));
@@ -417,6 +452,7 @@ static void desktop_selected_handler(ClientAppWindow * win, gpointer user_data) 
 static gboolean delete_cb(GtkWidget * widget, GdkEvent * event, gpointer user_data) {
     ClientApp * app = CLIENT_APP(user_data);
 
+    if (SPICE_IS_WIN(widget)) spice_window_save_history(SPICE_WIN(widget));
     if (app->connection)
         client_conn_disconnect(app->connection, CLIENT_CONN_DISCONNECT_USER);
     if (app->main_window != NULL && GTK_WIDGET(app->main_window) == widget) {
@@ -646,6 +682,10 @@ void usb_connect_failed(GObject * object, SpiceUsbDevice * device,
                         GError * error, gpointer user_data);
 static gboolean check_inactivity(gpointer user_data);
 static gboolean check_ungrab(gpointer user_data);
+static void display_monitors(SpiceChannel *display, GParamSpec *pspec, ClientApp *app);
+static void layout_changed(DisplayLayout *layout, ClientApp *app) {
+    if (app->desktop_channel) display_monitors(app->desktop_channel, NULL, app);
+}
 
 /*
  * Start the Spice connection with the current parameters, in the configuration object.
@@ -655,6 +695,10 @@ static gboolean check_ungrab(gpointer user_data);
  */
 static void client_app_connect(ClientApp * app) {
     SpiceSession * session = client_conn_get_session(app->connection);
+    if (client_conn_selected_display() == 1) {
+        app->display_layout = display_layout_new(app->connection);
+        g_signal_connect_object(app->display_layout, "changed", G_CALLBACK(layout_changed), app, 0);
+    }
     client_conf_set_gtk_session_options(app->conf, G_OBJECT(spice_gtk_session_get(session)));
     g_signal_connect(session, "channel-new",
                      G_CALLBACK(channel_new), app);
@@ -715,6 +759,11 @@ static void channel_new(SpiceSession * s, SpiceChannel * channel, gpointer user_
     }
 
     if (SPICE_IS_DISPLAY_CHANNEL(channel)) {
+        gint channel_id;
+        g_object_get(channel, "channel-id", &channel_id, NULL);
+        if (channel_id != client_conn_selected_display())
+            return;
+        g_set_object(&app->desktop_channel, channel);
         g_signal_connect(channel, "notify::monitors",
                          G_CALLBACK(display_monitors), app);
     }
@@ -753,6 +802,26 @@ static void connection_disconnected(ClientConn * conn, ClientConnDisconnectReaso
                                     gpointer user_data) {
     ClientApp * app = CLIENT_APP(user_data);
 
+    if (app->inactivity_source) { g_source_remove(app->inactivity_source); app->inactivity_source = 0; }
+    g_clear_object(&app->display_layout);
+    g_clear_object(&app->desktop_channel);
+    if (app->ungrab_source) { g_source_remove(app->ungrab_source); app->ungrab_source = 0; }
+    if (app->history_mode) {
+        GList *windows = g_list_copy(gtk_application_get_windows(GTK_APPLICATION(app)));
+        for (GList *p = windows; p; p = p->next)
+            if (SPICE_IS_WIN(p->data)) gtk_widget_destroy(p->data);
+        g_list_free(windows);
+        app->main = NULL;
+        g_clear_object(&app->connection);
+        app->grab_disabled = FALSE;
+        if (app->main_window) {
+            show_history(app);
+            if (reason != CLIENT_CONN_DISCONNECT_USER && reason != CLIENT_CONN_DISCONNECT_NO_ERROR)
+                client_app_window_error(app->main_window, "连接已中断或无法建立，请检查地址和服务器状态后重试。");
+        }
+        return;
+    }
+
     if (app->main_window) {
         client_app_show_login(app, "Failed to establish the connection, see the log file for further information.");
         client_app_window_set_central_widget_sensitive(app->main_window, TRUE);
@@ -784,6 +853,21 @@ static void spice_win_display_mark(SpiceChannel * channel, gint mark, SpiceWindo
 static void set_cp_sensitive(SpiceWindow * win, ClientApp * app);
 static void user_activity_cb(SpiceWindow * win, ClientApp * app);
 
+static gboolean hide_secondary(GtkWidget *window, GdkEvent *event, gpointer unused) {
+    spice_win_release_mouse_pointer(SPICE_WIN(window));
+    g_object_set_data(G_OBJECT(window), "user-hidden", GINT_TO_POINTER(1));
+    gtk_widget_hide(window);
+    return TRUE;
+}
+
+static gboolean display_window_delete(GtkWidget *window, GdkEvent *event, ClientApp *app) {
+    const GArray *remote = display_layout_get_monitors(app->display_layout);
+    gint primary = remote && remote->len ? g_array_index(remote, RemoteMonitor, 0).id : 0;
+    if (spice_window_get_monitor(SPICE_WIN(window)) == primary)
+        return delete_cb(window, event, app);
+    return hide_secondary(window, event, NULL);
+}
+
 /*
  * Monitor changes handler. Creates a SpiceWindow for each new monitor.
  * Currently, multimonitor configurations are still not fully supported.
@@ -798,25 +882,39 @@ static void display_monitors(SpiceChannel * display, GParamSpec * pspec, ClientA
                  "monitors", &monitors,
                  NULL);
     g_return_if_fail(monitors != NULL);
-    g_return_if_fail(id == 0); // Only one display channel supported
+    g_return_if_fail(id == client_conn_selected_display());
     g_debug("Reported %d monitors in display channel %d", monitors->len, id);
 
-    for (i = 0; i < monitors->len; ++i) {
-        if (!get_window_for_monitor(app, i)) {
+    const GArray *remote = display_layout_get_monitors(app->display_layout);
+    guint count = remote && remote->len ? remote->len : monitors->len;
+    GList *windows = g_list_copy(gtk_application_get_windows(GTK_APPLICATION(app)));
+    for (GList *p = windows; p; p = p->next) {
+        if (!SPICE_IS_WIN(p->data)) continue;
+        gint window_id = spice_window_get_monitor(p->data);
+        gboolean exists = FALSE;
+        for (guint n = 0; n < count; n++)
+            if (window_id == (remote && remote->len ? g_array_index(remote, RemoteMonitor, n).id : (gint)n))
+                exists = TRUE;
+        if (!exists) gtk_widget_destroy(p->data);
+    }
+    g_list_free(windows);
+
+    for (i = 0; i < count; ++i) {
+        gint monitor_id = remote && remote->len ? g_array_index(remote, RemoteMonitor, i).id : (gint)i;
+        if (!get_window_for_monitor(app, monitor_id)) {
             g_autofree gchar * name = NULL;
             if (app->desktop_name) {
                 name = g_strdup(app->desktop_name);
             } else {
                 g_object_get(client_conn_get_session(app->connection), "name", &name, NULL);
             }
-            g_autofree gchar * title = g_strdup_printf("%s - flexVDI Client", name);
-            SpiceWindow * win = spice_window_new(app->connection, display, app->conf, i, title);
+            g_autofree gchar * title = g_strdup_printf("%s — 显示器 %u - flexVDI Client", name, monitor_id + 1);
+            SpiceWindow * win = spice_window_new(app->connection, display, app->conf, monitor_id, title);
             // Inform GTK that this is an application window
             gtk_application_add_window(GTK_APPLICATION(app), GTK_WINDOW(win));
             spice_g_signal_connect_object(display, "display-mark",
                                           G_CALLBACK(spice_win_display_mark), win, 0);
             if (i == 0) {
-                g_signal_connect(win, "delete-event", G_CALLBACK(delete_cb), app);
 
                 // Start the inactivity timeout when the first window is created
                 app->last_input_time = g_get_monotonic_time();
@@ -826,18 +924,43 @@ static void display_monitors(SpiceChannel * display, GParamSpec * pspec, ClientA
                 }
                 check_ungrab(app);
             }
+            g_signal_connect(win, "delete-event", G_CALLBACK(display_window_delete), app);
+            if (app->display_layout) spice_window_add_displays_button(win, app->display_layout);
             g_signal_connect(win, "user-activity", G_CALLBACK(user_activity_cb), app);
-            if (monitors->len == 1)
+            if (count == 1)
                 gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER);
+            else {
+                spice_window_start_windowed(win);
+                gtk_window_set_default_size(GTK_WINDOW(win), 960, 640);
+                gtk_window_move(GTK_WINDOW(win), 80 + 60 * i, 80 + 40 * i);
+            }
+            if (remote && remote->len) {
+                const RemoteMonitor *m = &g_array_index(remote, RemoteMonitor, i);
+                GdkRectangle workarea;
+                gdk_monitor_get_workarea(gdk_display_get_primary_monitor(gdk_display_get_default()), &workarea);
+                gtk_window_set_default_size(GTK_WINDOW(win), MIN(m->width, workarea.width * 9 / 10),
+                    MIN(m->height + 48, workarea.height * 9 / 10));
+            }
             gtk_widget_show_all(GTK_WIDGET(win));
             set_cp_sensitive(win, app);
             if (app->main_window) {
-                gtk_widget_destroy(GTK_WIDGET(app->main_window));
-                app->main_window = NULL;
+                if (app->history_mode) gtk_widget_hide(GTK_WIDGET(app->main_window));
+                else {
+                    gtk_widget_destroy(GTK_WIDGET(app->main_window));
+                    app->main_window = NULL;
+                }
                 GSimpleAction * prefs_action =
                     G_SIMPLE_ACTION(g_action_map_lookup_action(G_ACTION_MAP(app), "preferences"));
                 g_simple_action_set_enabled(prefs_action, FALSE);
             }
+        }
+        SpiceWindow *window = get_window_for_monitor(app, monitor_id);
+        if (window) {
+            if (remote && remote->len)
+                spice_window_set_remote_monitor(window, &g_array_index(remote, RemoteMonitor, i));
+            if (display_layout_should_reveal(app->display_layout))
+                g_object_set_data(G_OBJECT(window), "user-hidden", NULL);
+            if (!g_object_get_data(G_OBJECT(window), "user-hidden")) gtk_widget_show(GTK_WIDGET(window));
         }
     }
 
@@ -846,7 +969,7 @@ static void display_monitors(SpiceChannel * display, GParamSpec * pspec, ClientA
 
 
 static void spice_win_display_mark(SpiceChannel * channel, gint mark, SpiceWindow * win) {
-    if (mark) {
+    if (mark && !g_object_get_data(G_OBJECT(win), "user-hidden")) {
         gtk_widget_show(GTK_WIDGET(win));
     } else {
         gtk_widget_hide(GTK_WIDGET(win));
@@ -916,6 +1039,8 @@ static void user_activity_cb(SpiceWindow * win, ClientApp * app) {
  */
 static gboolean check_inactivity(gpointer user_data) {
     ClientApp * app = CLIENT_APP(user_data);
+    app->inactivity_source = 0;
+    if (!app->connection) return FALSE;
     gint inactivity_timeout = client_conf_get_inactivity_timeout(app->conf);
     gint64 now = g_get_monotonic_time();
     gint time_to_inactivity = (app->last_input_time - now)/1000 + inactivity_timeout*1000;
@@ -923,7 +1048,7 @@ static gboolean check_inactivity(gpointer user_data) {
     if (time_to_inactivity <= 0) {
         client_conn_disconnect(app->connection, CLIENT_CONN_DISCONNECT_INACTIVITY);
     } else if (time_to_inactivity <= 30000) {
-        g_timeout_add(100, check_inactivity, app);
+        app->inactivity_source = g_timeout_add(100, check_inactivity, app);
         GtkWindow * win = gtk_application_get_active_window(GTK_APPLICATION(app));
         if (win != NULL && SPICE_IS_WIN(win)) {
             int seconds = (time_to_inactivity + 999) / 1000;
@@ -932,7 +1057,7 @@ static gboolean check_inactivity(gpointer user_data) {
             spice_win_show_notification(SPICE_WIN(win), text, 200);
         }
     } else {
-        g_timeout_add(time_to_inactivity - 30000, check_inactivity, app);
+        app->inactivity_source = g_timeout_add(time_to_inactivity - 30000, check_inactivity, app);
     }
 
     return FALSE;
@@ -941,6 +1066,8 @@ static gboolean check_inactivity(gpointer user_data) {
 
 static gboolean check_ungrab(gpointer user_data) {
     ClientApp * app = CLIENT_APP(user_data);
+    app->ungrab_source = 0;
+    if (!app->connection) return FALSE;
     gint64 now = g_get_monotonic_time();
     // Ungrab after 55 seconds, to avoid race condition with a 1-minute screenlock timeout
     gint time_to_ungrab = (app->last_input_time - now)/1000 + 55000;
@@ -955,7 +1082,7 @@ static gboolean check_ungrab(gpointer user_data) {
         }
         app->grab_disabled = TRUE;
     } else {
-        g_timeout_add(time_to_ungrab, check_ungrab, app);
+        app->ungrab_source = g_timeout_add(time_to_ungrab, check_ungrab, app);
     }
 
     return FALSE;

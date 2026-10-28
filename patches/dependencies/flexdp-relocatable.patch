@@ -1,0 +1,10 @@
+diff --git a/flexdp.pc.in b/flexdp.pc.in
+index 5d48ed7..3b4bee7 100644
+--- a/flexdp.pc.in
++++ b/flexdp.pc.in
+@@ -3,4 +3,4 @@ Description: @PACKAGE_NAME@
+ Version: @PACKAGE_VERSION@
+ Requires: spice-protocol >= 0.12
+ 
+-Cflags: -I@prefix@/include
++Cflags: -I${pcfiledir}/../../include

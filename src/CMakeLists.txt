@@ -4,11 +4,11 @@ set(LIB_SOURCES
 set(LIB_HEADERS
     client-conn.h client-log.h flexvdi-port.h configuration.h client-request.h
     printclient.h conn-forward.h)
-set(CLIENT_SOURCES client-app.c client-win.c spice-win.c about.c)
+set(CLIENT_SOURCES client-app.c client-win.c spice-win.c about.c connection-history.c display-layout.c)
 
 if (WIN32)
     add_custom_target(ico_icon
-                      COMMAND convert "${PROJECT_SOURCE_DIR}/resources/images/icon.png" icon.ico
+                      COMMAND magick "${PROJECT_SOURCE_DIR}/resources/images/icon.png" icon.ico
                       DEPENDS "${PROJECT_SOURCE_DIR}/resources/images/icon.png")
     file(WRITE icon.rc "IDI_ICON1 ICON DISCARDABLE \"${CMAKE_CURRENT_BINARY_DIR}/icon.ico\"")
     set(LIB_SOURCES ${LIB_SOURCES}
@@ -39,7 +39,8 @@ add_definitions(-DG_LOG_DOMAIN=\"flexvdi\" -DVERSION_STRING=\"${FLEXVDI_VERSION}
 # libflexvdi-client
 add_library(flexvdi-client SHARED ${LIB_SOURCES})
 target_link_libraries(flexvdi-client ${LIB_LIBRARIES})
-set_target_properties(flexvdi-client PROPERTIES PUBLIC_HEADER "${LIB_HEADERS}")
+set_target_properties(flexvdi-client PROPERTIES PUBLIC_HEADER "${LIB_HEADERS}"
+                      ARCHIVE_OUTPUT_NAME flexvdi-client-library)
 if (APPLE)
     target_compile_options(flexvdi-client PRIVATE -xobjective-c -mmacosx-version-min=10.10)
     target_link_libraries(flexvdi-client "-framework Cocoa")

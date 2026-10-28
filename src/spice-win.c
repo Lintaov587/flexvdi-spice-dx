@@ -21,6 +21,7 @@
 #include "flexvdi-port.h"
 #include "printclient.h"
 #include "about.h"
+#include "connection-history.h"
 
 #ifdef __APPLE__
 #include <gdk/gdkquartz.h>
@@ -67,6 +68,13 @@ struct _SpiceWindow {
     GtkToolButton * about_button;
     guint notification_timeout_id;
     gulong channel_event_handler_id;
+    guint history_source;
+    gint64 history_connected_at, history_last_capture;
+    gboolean history_saved;
+    DisplayLayout *layout;
+    gboolean is_primary, has_remote_monitor;
+    gint allocation_width, allocation_height;
+    gint64 resize_suppressed_until;
 };
 
 enum {
@@ -191,6 +199,8 @@ static void spice_window_init(SpiceWindow * win) {
 
 static void spice_window_dispose(GObject * obj) {
     SpiceWindow * win = SPICE_WIN(obj);
+    g_clear_object(&win->layout);
+    if (win->history_source) { g_source_remove(win->history_source); win->history_source = 0; }
     g_clear_object(&win->conn);
     g_clear_object(&win->conf);
     if (win->display_channel)
@@ -216,6 +226,35 @@ static gboolean leave_window_cb(GtkWidget * widget, GdkEventCrossing * event,
 static void mouse_grab_cb(SpiceDisplay * display, gint status, gpointer user_data);
 static void spice_size_allocate(GtkWidget * widget, GdkRectangle * a, gpointer user_data);
 
+void spice_window_save_history(SpiceWindow *win) {
+    if (!win->conf || !win->display_channel || !win->is_primary || !win->spice) return;
+    const gchar *uri = client_conf_get_uri(win->conf);
+    if (!uri) return;
+    SpiceDisplayPrimary primary;
+    if (!spice_display_channel_get_primary(win->display_channel, 0, &primary) ||
+        !primary.data || primary.width <= 0 || primary.height <= 0 ||
+        (primary.format != SPICE_SURFACE_FMT_32_xRGB && primary.format != SPICE_SURFACE_FMT_32_ARGB)) return;
+    gboolean ready = FALSE;
+    g_object_get(win->spice, "ready", &ready, NULL);
+    if (!ready) return;
+    gboolean dx = client_conn_selected_display() == 1;
+    if (dx && g_strcmp0(g_object_get_data(G_OBJECT(win->display_channel), "dx-video-status"), "H.264 decoded")) return;
+    g_autoptr(GdkPixbuf) desktop = spice_display_get_pixbuf(win->spice);
+    if (!desktop) return;
+    g_autofree gchar *name = NULL;
+    g_object_get(client_conn_get_session(win->conn), "name", &name, NULL);
+    client_history_record(uri, name, dx, win->history_connected_at, desktop, !win->history_saved);
+    win->history_saved = TRUE;
+    win->history_last_capture = g_get_monotonic_time();
+}
+
+static gboolean history_capture(gpointer data) {
+    SpiceWindow *win = SPICE_WIN(data);
+    if (!win->history_saved || g_get_monotonic_time() - win->history_last_capture >= 30 * G_USEC_PER_SEC)
+        spice_window_save_history(win);
+    return G_SOURCE_CONTINUE;
+}
+
 void usb_connect_failed(GObject * object, SpiceUsbDevice * device,
                         GError * error, gpointer user_data);
 
@@ -233,7 +272,10 @@ SpiceWindow * spice_window_new(ClientConn * conn, SpiceChannel * channel,
 
     /* spice display */
     SpiceSession * session = client_conn_get_session(conn);
-    win->spice = spice_display_new_with_monitor(session, 0, id);
+    gint channel_id;
+    g_object_get(channel, "channel-id", &channel_id, NULL);
+    win->spice = spice_display_new_with_monitor(session, channel_id,
+        g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0 ? 0 : id);
     gtk_box_pack_end(win->content_box, GTK_WIDGET(win->spice), TRUE, TRUE, 0);
     gtk_widget_grab_focus(GTK_WIDGET(win->spice));
 
@@ -326,7 +368,58 @@ SpiceWindow * spice_window_new(ClientConn * conn, SpiceChannel * channel,
             break;
     }
 
+    if (id == 0 && client_conf_get_uri(conf)) {
+        win->is_primary = TRUE;
+        win->history_connected_at = g_get_real_time() / G_USEC_PER_SEC;
+        win->history_source = g_timeout_add_seconds(3, history_capture, win);
+    }
     return win;
+}
+
+void spice_window_set_remote_monitor(SpiceWindow *win, const RemoteMonitor *monitor) {
+    if (monitor && !win->has_remote_monitor) {
+        win->has_remote_monitor = TRUE;
+        win->resize_suppressed_until = g_get_monotonic_time() + G_USEC_PER_SEC;
+        GtkAllocation allocation;
+        gtk_widget_get_allocation(GTK_WIDGET(win->spice), &allocation);
+        win->allocation_width = allocation.width;
+        win->allocation_height = allocation.height;
+    }
+    win->is_primary = monitor && monitor->x == 0 && monitor->y == 0;
+    if (win->is_primary && !win->history_source && client_conf_get_uri(win->conf)) {
+        win->history_connected_at = g_get_real_time() / G_USEC_PER_SEC;
+        win->history_source = g_timeout_add_seconds(3, history_capture, win);
+    } else if (!win->is_primary && win->history_source) {
+        g_source_remove(win->history_source);
+        win->history_source = 0;
+    }
+    GVariant *region = monitor ? g_variant_ref_sink(g_variant_new("(iiiii)",
+        monitor->x, monitor->y, monitor->width, monitor->height, monitor->input_id)) : NULL;
+    g_object_set(win->spice, "remote-monitor", region, NULL);
+    if (region) g_variant_unref(region);
+}
+
+void spice_window_start_windowed(SpiceWindow *win) {
+    win->initially_fullscreen = FALSE;
+    win->maximized = FALSE;
+    gtk_window_unfullscreen(GTK_WINDOW(win));
+    gtk_window_unmaximize(GTK_WINDOW(win));
+    gtk_window_resize(GTK_WINDOW(win), 960, 640);
+}
+
+static void displays_clicked(GtkToolButton *button, DisplayLayout *layout) {
+    GtkWidget *top = gtk_widget_get_toplevel(GTK_WIDGET(button));
+    if (GTK_IS_WINDOW(top)) display_layout_show(layout, GTK_WINDOW(top));
+}
+
+void spice_window_add_displays_button(SpiceWindow *win, DisplayLayout *layout) {
+    g_set_object(&win->layout, layout);
+    GtkToolItem *button = gtk_tool_button_new(NULL, "显示器");
+    gtk_tool_button_set_icon_name(GTK_TOOL_BUTTON(button), "video-display-symbolic");
+    gtk_widget_set_tooltip_text(GTK_WIDGET(button), "创建显示器 / 显示全部窗口");
+    gtk_toolbar_insert(win->toolbar, button, -1);
+    g_signal_connect_object(button, "clicked", G_CALLBACK(displays_clicked), layout, 0);
+    gtk_widget_show(GTK_WIDGET(button));
 }
 
 static void set_printers_menu_visibility(gpointer user_data) {
@@ -399,6 +492,15 @@ static gboolean configure_event(GtkWidget * widget, GdkEvent * event, gpointer u
 
 static void spice_size_allocate(GtkWidget * widget, GdkRectangle * a, gpointer user_data) {
     SpiceWindow * win = SPICE_WIN(user_data);
+
+    gboolean changed = a->width != win->allocation_width || a->height != win->allocation_height;
+    win->allocation_width = a->width;
+    win->allocation_height = a->height;
+    if (changed && win->layout && win->has_remote_monitor &&
+        g_get_monotonic_time() > win->resize_suppressed_until && gtk_widget_get_mapped(widget)) {
+        gint scale = gtk_widget_get_scale_factor(widget);
+        display_layout_resize(win->layout, win->id, a->width * scale, a->height * scale);
+    }
 
     // Save the window geometry only if we are not maximized or fullscreen.
     if (!(win->maximized || win->fullscreen)) {

@@ -1,0 +1,9 @@
+**
+!.build/
+!.build/downloads/
+!.build/downloads/spice-streaming-agent-0.3.tar.xz
+!server/
+!server/patches/
+!server/patches/spice-streaming-agent-fullscreen.patch
+!server/streaming/
+!server/streaming/spice-fullscreen.Dockerfile

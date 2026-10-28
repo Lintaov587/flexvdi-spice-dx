@@ -1,0 +1,1781 @@
+--- a/src/channel-display-gst.c
++++ b/src/channel-display-gst.c
+@@ -22,11 +22,13 @@
+ #include "common/recorder.h"
+ 
+ #include "channel-display-priv.h"
++#include "spice-latency-priv.h"
+ 
+ #include <gst/gst.h>
+ #include <gst/app/gstappsrc.h>
+ #include <gst/app/gstappsink.h>
+ #include <gst/video/gstvideometa.h>
++#include "spice-direct-priv.h"
+ 
+ 
+ typedef struct SpiceGstFrame SpiceGstFrame;
+@@ -46,6 +48,9 @@
+     GstAppSink *appsink;
+     GstElement *pipeline;
+     GstClock *clock;
++    guint bus_watch;
++    guint64 dx_presented_frames;
++    gboolean dx_low_latency, dx_trace;
+ 
+     /* ---------- Decoding and display queues ---------- */
+ 
+@@ -90,11 +95,13 @@
+     SpiceFrame *encoded_frame;
+     GstSample *decoded_sample;
+     guint queue_len;
++    gint64 decoded_us;
++    gint64 parsed_us, hardware_us;
+ };
+ 
+ static SpiceGstFrame *create_gst_frame(GstBuffer *buffer, SpiceFrame *frame)
+ {
+-    SpiceGstFrame *gstframe = g_new(SpiceGstFrame, 1);
++    SpiceGstFrame *gstframe = g_new0(SpiceGstFrame, 1);
+ 
+     gstframe->timestamp = GST_BUFFER_PTS(buffer);
+ #if GST_CHECK_VERSION(1,14,0)
+@@ -177,6 +184,37 @@
+ 
+     stream_display_frame(decoder->base.stream, gstframe->encoded_frame,
+                          width, height, spice_gst_buffer_get_stride(buffer), mapinfo.data);
++    if (decoder->dx_trace) {
++        SpiceDxLatencyFrame *trace = g_new0(SpiceDxLatencyFrame, 1);
++        trace->received_us = gstframe->encoded_frame->creation_time;
++        trace->decoded_us = gstframe->decoded_us;
++        trace->parsed_us = gstframe->parsed_us;
++        trace->hardware_us = gstframe->hardware_us;
++        trace->composed_us = g_get_monotonic_time();
++        /* Optional benchmark marker at guest pixel (64,64): A5, sequence16, checksum8. */
++        gint stride = spice_gst_buffer_get_stride(buffer);
++        if (stride == SPICE_UNKNOWN_STRIDE) stride = width * 4;
++        if (width >= 384 && height > 80 && stride >= width * 4 &&
++            mapinfo.size >= (gsize)stride * 81) {
++            guint32 bits = 0;
++            for (guint i = 0; i < 32; i++) {
++                const guint8 *pixel = mapinfo.data + 80 * stride + (64 + i * 10 + 5) * 4;
++                bits = (bits << 1) | ((pixel[0] + pixel[1] + pixel[2]) > 384);
++            }
++            guint32 sequence = (bits >> 8) & 0xffff;
++            trace->marker_valid = (bits >> 24) == 0xa5 &&
++                (bits & 0xff) == (((sequence >> 8) ^ sequence ^ 0x5a) & 0xff);
++            trace->marker = sequence;
++        }
++        g_object_set_data_full(G_OBJECT(decoder->base.stream->channel), "dx-latency-frame", trace, g_free);
++    }
++    if (g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0 &&
++        ++decoder->dx_presented_frames == 1) {
++        g_message("DX-H264: first hardware-decoded frame composed; stream=%u size=%dx%d stride=%d",
++                  decoder->base.stream->id, width, height, spice_gst_buffer_get_stride(buffer));
++        g_object_set_data_full(G_OBJECT(decoder->base.stream->channel), "dx-video-status",
++                              g_strdup("H.264 decoded"), g_free);
++    }
+     gst_buffer_unmap(buffer, &mapinfo);
+ 
+  error:
+@@ -287,6 +325,21 @@
+     g_mutex_lock(&decoder->queues_mutex);
+ 
+     while (!decoder->timer_id) {
++        if (decoder->dx_low_latency) {
++            /* Decode every compressed frame to preserve H.264 references, but
++             * present only the newest already-decoded frame when the UI is busy. */
++            while (decoder->pending_samples) {
++                if (decoder->display_frame) {
++                    free_gst_frame(decoder->display_frame);
++                    decoder->display_frame = NULL;
++                    stream_dropped_frame_on_playback(decoder->base.stream);
++                }
++                fetch_pending_sample(decoder);
++            }
++            if (decoder->display_frame)
++                decoder->timer_id = g_timeout_add(0, display_frame, decoder);
++            break;
++        }
+         while (decoder->display_frame == NULL && decoder->pending_samples) {
+             fetch_pending_sample(decoder);
+         }
+@@ -332,6 +385,63 @@
+ {
+     SpiceGstDecoder *decoder = video_decoder;
+ 
++    if (spice_direct_enabled()) {
++        /* This is the decoder's streaming thread: no display timer, CPU map,
++         * canvas copy or GTK repaint is involved in video presentation. */
++        GstSample *sample = gst_app_sink_pull_sample(gstappsink);
++        if (!sample) return GST_FLOW_FLUSHING;
++        GstBuffer *buffer = gst_sample_get_buffer(sample);
++        SpiceGstFrame *frame = NULL;
++        g_mutex_lock(&decoder->queues_mutex);
++        GList *entry = find_frame_entry(decoder, buffer);
++        if (entry) {
++            frame = entry->data;
++            pop_up_to_frame(decoder, frame);
++        }
++        g_mutex_unlock(&decoder->queues_mutex);
++        SpiceDirectHub *hub = g_object_dup_data(
++            G_OBJECT(decoder->base.stream->channel), "dx-direct-hub",
++            spice_direct_hub_ref, NULL);
++        GError *error = NULL;
++        gboolean ok = TRUE;
++        gboolean submitted = FALSE;
++        gint64 begin = g_get_monotonic_time();
++        if (hub) {
++            GPtrArray *views = g_ptr_array_new_with_free_func(spice_direct_unref);
++            g_mutex_lock(&hub->mutex);
++            for (guint i = 0; i < hub->bindings->len; i++)
++                g_ptr_array_add(views, spice_direct_ref(g_ptr_array_index(hub->bindings, i), NULL));
++            g_mutex_unlock(&hub->mutex);
++            for (guint i = 0; i < views->len && ok; i++) {
++                SpiceDirectBinding *binding = g_ptr_array_index(views, i);
++                g_mutex_lock(&binding->mutex);
++                if (binding->owner) {
++                    ok = binding->present(binding->owner, sample, &error);
++                    submitted |= binding->submitted;
++                }
++                g_mutex_unlock(&binding->mutex);
++            }
++            g_ptr_array_unref(views);
++            spice_direct_hub_unref(hub);
++        }
++        if (decoder->dx_trace && frame && ok && submitted)
++            g_message("DX-DIRECT-LATENCY client_us=%" G_GINT64_FORMAT
++                      " submit_us=%" G_GINT64_FORMAT,
++                      g_get_monotonic_time() - frame->encoded_frame->creation_time,
++                      g_get_monotonic_time() - begin);
++        if (frame) free_gst_frame(frame);
++        gst_sample_unref(sample);
++        if (!ok) {
++            gst_element_message_full(GST_ELEMENT(gstappsink), GST_MESSAGE_ERROR,
++                GST_STREAM_ERROR, GST_STREAM_ERROR_FAILED,
++                g_strdup(error ? error->message : "Direct presentation failed"),
++                NULL, __FILE__, G_STRFUNC, __LINE__);
++            g_clear_error(&error);
++            return GST_FLOW_ERROR;
++        }
++        return GST_FLOW_OK;
++    }
++
+     g_mutex_lock(&decoder->queues_mutex);
+     decoder->pending_samples++;
+     if (decoder->timer_id && decoder->display_frame) {
+@@ -352,13 +462,14 @@
+     }
+ 
+     gst_element_set_state(decoder->pipeline, GST_STATE_NULL);
+-    gst_object_unref(decoder->appsrc);
+-    if (decoder->appsink) {
+-        gst_object_unref(decoder->appsink);
+-    }
+-    gst_object_unref(decoder->pipeline);
+-    gst_object_unref(decoder->clock);
+-    decoder->pipeline = NULL;
++    if (decoder->bus_watch) {
++        g_source_remove(decoder->bus_watch);
++        decoder->bus_watch = 0;
++    }
++    gst_clear_object(&decoder->appsrc);
++    gst_clear_object(&decoder->appsink);
++    gst_clear_object(&decoder->pipeline);
++    gst_clear_object(&decoder->clock);
+ }
+ 
+ static gboolean handle_pipeline_message(GstBus *bus, GstMessage *msg, gpointer video_decoder)
+@@ -372,7 +483,18 @@
+         gst_message_parse_error(msg, &err, &debug_info);
+         spice_warning("GStreamer error from element %s: %s",
+                       GST_OBJECT_NAME(msg->src), err->message);
++        if (g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0) {
++            GObject *channel = G_OBJECT(decoder->base.stream->channel);
++            g_object_set_data_full(channel, "dx-video-status", g_strdup(err->message), g_free);
++            g_object_set_data(channel, "dx-video-error", GINT_TO_POINTER(1));
++            /* Bus watches run in the UI main context, unlike stream messages. */
++            const SpiceRect *dest = &decoder->base.stream->dest;
++            g_signal_emit_by_name(channel, "display-invalidate", dest->left, dest->top,
++                                  dest->right - dest->left, dest->bottom - dest->top);
++        }
+         if (debug_info) {
++            if (g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0)
++                g_warning("DX-H264 pipeline details: %s", debug_info);
+             SPICE_DEBUG("debug information: %s", debug_info);
+             g_free(debug_info);
+         }
+@@ -415,6 +537,10 @@
+      *   needed by those that follow.
+      */
+     caps = gst_caps_from_string(gst_opts[decoder->base.codec_type].dec_caps);
++    if (g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0) {
++        gst_caps_set_simple(caps, "stream-format", G_TYPE_STRING, "byte-stream",
++                            "alignment", G_TYPE_STRING, "au", NULL);
++    }
+     g_object_set(source,
+                  "caps", caps,
+                  "is-live", TRUE,
+@@ -423,6 +549,8 @@
+                  "block", TRUE,
+                  NULL);
+     gst_caps_unref(caps);
++    if (decoder->dx_low_latency)
++        g_object_set(source, "min-latency", G_GINT64_CONSTANT(0), "max-latency", G_GINT64_CONSTANT(0), NULL);
+     decoder->appsrc = GST_APP_SRC(gst_object_ref(source));
+ }
+ 
+@@ -438,6 +566,7 @@
+         GList *l = find_frame_entry(decoder, buffer);
+         if (l) {
+             SpiceGstFrame *gstframe = l->data;
++            gstframe->decoded_us = g_get_monotonic_time();
+             const SpiceFrame *frame = gstframe->encoded_frame;
+             /* Note that queue_len (the length of the queue prior to adding
+              * this frame) is crucial to correctly interpret the decoding time:
+@@ -474,6 +603,21 @@
+    return f ? GST_OBJECT_NAME(f) : GST_OBJECT_NAME(element);
+ }
+ 
++static GstPadProbeReturn trace_stage_probe(GstPad *pad, GstPadProbeInfo *info, gpointer data)
++{
++    SpiceGstDecoder *decoder = data;
++    g_mutex_lock(&decoder->queues_mutex);
++    GList *entry = find_frame_entry(decoder, GST_PAD_PROBE_INFO_BUFFER(info));
++    if (entry) {
++        SpiceGstFrame *frame = entry->data;
++        if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pad), "dx-trace-stage")) == 1)
++            frame->parsed_us = g_get_monotonic_time();
++        else frame->hardware_us = g_get_monotonic_time();
++    }
++    g_mutex_unlock(&decoder->queues_mutex);
++    return GST_PAD_PROBE_OK;
++}
++
+ /* This function is used to set a probe on the sink */
+ static void
+ deep_element_added_cb(GstBin *pipeline, GstBin *bin, GstElement *element,
+@@ -495,6 +639,56 @@
+     GstElement *playbin, *sink;
+     SpiceGstPlayFlags flags;
+     GstCaps *caps;
++
++    if (g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0) {
++        GError *error = NULL;
++        GstElement *source, *hw;
++        if (decoder->base.codec_type != SPICE_VIDEO_CODEC_TYPE_H264)
++            return FALSE;
++        g_message("DX-H264: presentation timing=%s; latency diagnostics=%s",
++                  decoder->dx_low_latency ? "interactive (no media-clock hold)" : "media-clock",
++                  decoder->dx_trace ? "on" : "off");
++        playbin = gst_parse_launch(spice_direct_enabled() ?
++            "appsrc name=source ! h264parse name=parser ! d3d11h264dec name=hwdecoder ! "
++            "video/x-raw(memory:D3D11Memory),format=NV12 ! "
++            "appsink name=sink sync=false enable-last-sample=false" :
++            "appsrc name=source ! h264parse name=parser ! d3d11h264dec name=hwdecoder ! "
++            "d3d11convert ! video/x-raw(memory:D3D11Memory),format=BGRx ! "
++            "d3d11download ! appsink name=sink caps=video/x-raw,format=BGRx sync=false", &error);
++        if (!playbin || error) {
++            g_warning("DX-H264: cannot create D3D11 decoder pipeline: %s", error ? error->message : "unknown error");
++            g_clear_error(&error);
++            if (playbin)
++                gst_object_unref(playbin);
++            return FALSE;
++        }
++        decoder->pipeline = playbin;
++        if (decoder->dx_trace) {
++            const gchar *stages[] = {"parser", "hwdecoder"};
++            for (guint i = 0; i < G_N_ELEMENTS(stages); i++) {
++                GstElement *element = gst_bin_get_by_name(GST_BIN(playbin), stages[i]);
++                GstPad *pad = gst_element_get_static_pad(element, "src");
++                g_object_set_data(G_OBJECT(pad), "dx-trace-stage", GINT_TO_POINTER(i + 1));
++                gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, trace_stage_probe, decoder, NULL);
++                gst_object_unref(pad);
++                gst_object_unref(element);
++            }
++        }
++        source = gst_bin_get_by_name(GST_BIN(playbin), "source");
++        app_source_setup(playbin, source, decoder);
++        gst_object_unref(source);
++        decoder->appsink = GST_APP_SINK(gst_bin_get_by_name(GST_BIN(playbin), "sink"));
++        hw = gst_bin_get_by_name(GST_BIN(playbin), "hwdecoder");
++        gint64 luid = 0;
++        guint vendor = 0, device = 0;
++        g_object_get(hw, "adapter-luid", &luid, "vendor-id", &vendor, "device-id", &device, NULL);
++        g_message("DX-H264: decoder=d3d11h264dec vendor=%04x device=%04x luid=%" G_GINT64_FORMAT
++                  "; presentation=%s", vendor, device, luid, spice_direct_enabled() ?
++                  "native NV12 decoder texture -> GPU video processor -> swapchain" : "GPU convert + CPU canvas");
++        gst_object_unref(hw);
++        deep_element_added_cb(GST_BIN(playbin), GST_BIN(playbin), GST_ELEMENT(decoder->appsink), decoder);
++        goto start_pipeline;
++    }
+ 
+     playbin = gst_element_factory_make("playbin", "playbin");
+     if (playbin == NULL) {
+@@ -565,6 +759,7 @@
+     g_warn_if_fail(decoder->appsrc == NULL);
+     decoder->pipeline = playbin;
+ 
++start_pipeline:
+     if (decoder->appsink) {
+         GstAppSinkCallbacks appsink_cbs = { NULL };
+         appsink_cbs.new_sample = new_sample;
+@@ -573,7 +768,7 @@
+         gst_app_sink_set_drop(decoder->appsink, FALSE);
+     }
+     bus = gst_pipeline_get_bus(GST_PIPELINE(decoder->pipeline));
+-    gst_bus_add_watch(bus, handle_pipeline_message, decoder);
++    decoder->bus_watch = gst_bus_add_watch(bus, handle_pipeline_message, decoder);
+     gst_object_unref(bus);
+ 
+     decoder->clock = gst_pipeline_get_clock(GST_PIPELINE(decoder->pipeline));
+@@ -733,7 +928,8 @@
+                                                     frame->data, frame->size, 0, frame->size,
+                                                     frame, (GDestroyNotify) spice_frame_free);
+ 
+-    GstClockTime pts = gst_clock_get_time(decoder->clock) - gst_element_get_base_time(decoder->pipeline) + ((uint64_t)MAX(0, margin)) * 1000 * 1000;
++    GstClockTime pts = gst_clock_get_time(decoder->clock) - gst_element_get_base_time(decoder->pipeline) +
++        ((uint64_t)(decoder->dx_low_latency ? 0 : MAX(0, margin))) * 1000 * 1000;
+     GST_BUFFER_DURATION(buffer) = GST_CLOCK_TIME_NONE;
+     GST_BUFFER_DTS(buffer) = GST_CLOCK_TIME_NONE;
+     GST_BUFFER_PTS(buffer) = pts;
+@@ -780,6 +976,10 @@
+ 
+     if (gstvideo_init()) {
+         decoder = g_new0(SpiceGstDecoder, 1);
++        decoder->dx_low_latency = g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0 &&
++                                  g_strcmp0(g_getenv("SPICE_DX_LOW_LATENCY"), "0") != 0;
++        decoder->dx_trace = g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0 &&
++                            g_strcmp0(g_getenv("SPICE_DX_TRACE"), "1") == 0;
+         decoder->base.destroy = spice_gst_decoder_destroy;
+         decoder->base.reschedule = spice_gst_decoder_reschedule;
+         decoder->base.queue_frame = spice_gst_decoder_queue_frame;
+@@ -830,6 +1030,16 @@
+     g_return_val_if_fail(gstvideo_init(), FALSE);
+     g_return_val_if_fail(VALID_VIDEO_CODEC_TYPE(codec_type), FALSE);
+ 
++    if (g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0) {
++        if (codec_type != SPICE_VIDEO_CODEC_TYPE_H264)
++            return FALSE;
++        GstElementFactory *factory = gst_element_factory_find("d3d11h264dec");
++        if (!factory)
++            return FALSE;
++        gst_object_unref(factory);
++        return TRUE;
++    }
++
+     type = GST_ELEMENT_FACTORY_TYPE_DECODER |
+            GST_ELEMENT_FACTORY_TYPE_MEDIA_VIDEO |
+            GST_ELEMENT_FACTORY_TYPE_MEDIA_IMAGE;
+--- a/src/channel-display.c
++++ b/src/channel-display.c
+@@ -943,9 +943,12 @@
+     }
+     spice_channel_set_capability(channel, SPICE_DISPLAY_CAP_MULTI_CODEC);
+ #ifdef HAVE_BUILTIN_MJPEG
+-    spice_channel_set_capability(channel, SPICE_DISPLAY_CAP_CODEC_MJPEG);
++    if (g_strcmp0(g_getenv("SPICE_DX_H264"), "1") != 0)
++        spice_channel_set_capability(channel, SPICE_DISPLAY_CAP_CODEC_MJPEG);
+ #endif
+     for (i = 1; i < G_N_ELEMENTS(gst_opts); i++) {
++        if (g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0 && i != SPICE_VIDEO_CODEC_TYPE_H264)
++            continue;
+         if (gstvideo_has_codec(i)) {
+             spice_channel_set_capability(channel, gst_opts[i].cap);
+         } else {
+@@ -1100,7 +1103,7 @@
+ }
+ 
+ /* coroutine context */
+-static void emit_invalidate(SpiceChannel *channel, SpiceRect *bbox)
++static void emit_invalidate(SpiceChannel *channel, const SpiceRect *bbox)
+ {
+     g_coroutine_signal_emit(channel, signals[SPICE_DISPLAY_INVALIDATE], 0,
+                             bbox->left, bbox->top,
+@@ -1141,6 +1144,19 @@
+     if (preferred_compression != SPICE_IMAGE_COMPRESSION_INVALID) {
+         spice_display_channel_change_preferred_compression(channel, preferred_compression);
+     }
++    if (g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0) {
++        const gint codecs[] = { SPICE_VIDEO_CODEC_TYPE_H264 };
++        GError *error = NULL;
++        if (!spice_display_channel_change_preferred_video_codec_types(channel, codecs, 1, &error)) {
++            g_object_set_data_full(G_OBJECT(channel), "dx-video-status", g_strdup(error->message), g_free);
++            g_object_set_data(G_OBJECT(channel), "dx-video-error", GINT_TO_POINTER(1));
++            g_warning("DX-H264: negotiation failed: %s", error->message);
++            g_clear_error(&error);
++        } else {
++            g_object_set_data_full(G_OBJECT(channel), "dx-video-status", g_strdup("H.264 requested"), g_free);
++            g_message("DX-H264: sent preferred-video-codecs=[H264]; awaiting actual video stream");
++        }
++    }
+ }
+ 
+ #define DRAW(type) {                                                    \
+@@ -1332,6 +1348,31 @@
+                                              const SpiceRect *dest, const SpiceClip *clip)
+ {
+     SpiceDisplayChannelPrivate *c = SPICE_DISPLAY_CHANNEL(channel)->priv;
++    if (g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0) {
++        display_surface *surface = find_surface(c, surface_id);
++        if (!surface || !surface->streaming_mode || dest->left != 0 || dest->top != 0 ||
++            dest->right != surface->width || dest->bottom != surface->height) {
++            const gchar *message = "DX requires a full-desktop streaming surface; partial video regions are not accepted";
++            g_warning("DX-H264: %s", message);
++            g_object_set_data_full(G_OBJECT(channel), "dx-video-status", g_strdup(message), g_free);
++            g_object_set_data(G_OBJECT(channel), "dx-video-error", GINT_TO_POINTER(1));
++            emit_invalidate(channel, dest);
++            return NULL;
++        }
++        if (codec_type != SPICE_VIDEO_CODEC_TYPE_H264) {
++            gchar *message = g_strdup_printf("Server selected codec %u instead of H.264", codec_type);
++            g_warning("DX-H264: %s; no alternate decoder selected", message);
++            g_object_set_data_full(G_OBJECT(channel), "dx-video-status", message, g_free);
++            g_object_set_data(G_OBJECT(channel), "dx-video-error", GINT_TO_POINTER(1));
++            emit_invalidate(channel, dest);
++            return NULL;
++        }
++        g_message("DX-H264: server stream=%u codec=H264 surface=%u rect=%d,%d-%d,%d",
++                  id, surface_id, dest->left, dest->top, dest->right, dest->bottom);
++        g_object_set_data_full(G_OBJECT(channel), "dx-video-status", g_strdup("H.264 received"), g_free);
++        g_object_set_data(G_OBJECT(channel), "dx-video-error", NULL);
++        emit_invalidate(channel, dest);
++    }
+     display_stream *st = g_new0(display_stream, 1);
+ 
+     st->id = id;
+@@ -1357,6 +1398,12 @@
+     }
+     if (st->video_decoder == NULL) {
+         g_warning("could not create a video decoder for codec %u", codec_type);
++        if (g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0) {
++            g_object_set_data_full(G_OBJECT(channel), "dx-video-status",
++                                  g_strdup("Cannot initialize the D3D11 H.264 decoder"), g_free);
++            g_object_set_data(G_OBJECT(channel), "dx-video-error", GINT_TO_POINTER(1));
++            emit_invalidate(channel, dest);
++        }
+         g_clear_pointer(&st, display_stream_destroy);
+     }
+     return st;
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -186,9 +186,8 @@
+ spice_gtk_version_script = '-Wl,--version-script=@0@'.format(spice_client_glib_syms_path)
+ spice_gtk_has_version_script = compiler.has_link_argument(spice_gtk_version_script)
+ if not spice_gtk_has_version_script
+-  spice_client_glib_syms = files('spice-glib-sym-file')
+-  spice_client_glib_syms_path = meson.current_source_dir() / 'spice-glib-sym-file'
+-  spice_gtk_version_script = ['-export-symbols', spice_client_glib_syms_path]
++  spice_client_glib_syms = []
++  spice_gtk_version_script = []
+ endif
+ 
+ # soversion
+@@ -207,7 +206,8 @@
+                                 include_directories : spice_gtk_include,
+                                 link_args : [spice_gtk_version_script],
+                                 link_depends : spice_client_glib_syms,
+-                                dependencies : spice_glib_deps)
++                                dependencies : spice_glib_deps,
++                                vs_module_defs : 'spice-glib-sym-file.def')
+ 
+ spice_client_glib_dep = declare_dependency(sources : [spice_marshals[1], spice_client_glib_enums[1]],
+                                            link_with : spice_client_glib_lib,
+@@ -299,6 +299,15 @@
+     spice_client_gtk_sources += 'spice-widget-egl.c'
+   endif
+ 
++  if host_machine.system() == 'windows'
++    add_languages('cpp', native : false)
++    spice_client_gtk_sources += ['spice-widget-d3d11.c', 'spice-widget-decode.cpp']
++    spice_gtk_deps += [compiler.find_library('d3d11'),
++                       compiler.find_library('dxgi'),
++                       dependency('gstreamer-d3d11-1.0'),
++                       compiler.find_library('d3dcompiler_47')]
++  endif
++
+   # keymaps
+   keymaps = ['xorgevdev',
+              'xorgkbd',
+@@ -373,11 +382,6 @@
+   # libspice-client-gtk.so
+   #
+   spice_client_gtk_syms = spice_client_glib_syms
+-  if not spice_gtk_has_version_script
+-    spice_client_gtk_syms = files('spice-gtk-sym-file')
+-    spice_client_gtk_syms_path = meson.current_source_dir() / 'spice-gtk-sym-file'
+-    spice_gtk_version_script = ['-export-symbols', spice_client_gtk_syms_path]
+-  endif
+ 
+   # soversion
+   # http://www.gnu.org/software/libtool/manual/html_node/Updating-version-info.html
+@@ -394,7 +398,8 @@
+                                  install : true,
+                                  link_args : [spice_gtk_version_script],
+                                  link_depends : spice_client_gtk_syms,
+-                                 dependencies : [spice_client_glib_dep, spice_gtk_deps, spice_wayland_deps])
++                                 dependencies : [spice_client_glib_dep, spice_gtk_deps, spice_wayland_deps],
++                                 vs_module_defs : 'spice-gtk-sym-file.def')
+ 
+   spice_client_gtk_dep = declare_dependency(sources : spice_widget_enums[1],
+                                             link_with : spice_client_gtk_lib,
+--- a/src/spice-widget-priv.h
++++ b/src/spice-widget-priv.h
+@@ -153,6 +153,13 @@
+ #endif // HAVE_EGL
+     double scroll_delta_y;
+     GWeakRef overlay_weak_ref;
++#ifdef G_OS_WIN32
++    struct SpiceD3D11 *dx;
++    struct SpiceDecodePresenter *decode_presenter;
++    gboolean remote_monitor_set;
++    gint remote_monitor_x, remote_monitor_y, remote_monitor_w, remote_monitor_h, remote_input_id;
++    gboolean dx_failed;
++#endif
+ };
+ 
+ int      spice_cairo_image_create                 (SpiceDisplay *display);
+@@ -176,4 +183,14 @@
+ #endif
+ void     spice_display_widget_update_monitor_area(SpiceDisplay *display);
+ 
++#ifdef G_OS_WIN32
++gboolean spice_d3d11_enabled(void);
++void spice_d3d11_queue(SpiceDisplay *display);
++void spice_d3d11_destroy(SpiceDisplay *display);
++gboolean spice_decode_enabled(void);
++void spice_decode_layout(SpiceDisplay *display);
++void spice_decode_destroy(SpiceDisplay *display);
++GdkPixbuf *spice_decode_snapshot(SpiceDisplay *display);
++#endif
++
+ G_END_DECLS
+--- a/src/spice-widget.c
++++ b/src/spice-widget.c
+@@ -98,7 +98,8 @@
+     PROP_ZOOM_LEVEL,
+     PROP_MONITOR_ID,
+     PROP_KEYPRESS_DELAY,
+-    PROP_READY
++    PROP_READY,
++    PROP_REMOTE_MONITOR
+ };
+ 
+ /* Signals */
+@@ -158,6 +159,13 @@
+     case PROP_MONITOR_ID:
+         g_value_set_int(value, d->monitor_id);
+         break;
++    case PROP_REMOTE_MONITOR:
++#ifdef G_OS_WIN32
++        if (d->remote_monitor_set)
++            g_value_take_variant(value, g_variant_ref_sink(g_variant_new("(iiiii)",
++                d->remote_monitor_x, d->remote_monitor_y, d->remote_monitor_w, d->remote_monitor_h, d->remote_input_id)));
++#endif
++        break;
+     case PROP_KEYBOARD_GRAB:
+         g_value_set_boolean(value, d->keyboard_grab_enable);
+         break;
+@@ -248,6 +256,13 @@
+ static gint get_display_id(SpiceDisplay *display)
+ {
+     SpiceDisplayPrivate *d = display->priv;
++
++#ifdef G_OS_WIN32
++    /* The atlas uses global X11 coordinates. Its input origin is the primary
++     * NVIDIA output's Mutter index, not streaming display channel 1. */
++    if (d->remote_monitor_set)
++        return d->remote_input_id;
++#endif
+ 
+     /* supported monitor_id only with display channel #0 */
+     if (d->channel_id == 0 && d->monitor_id >= 0)
+@@ -314,6 +329,20 @@
+     int i;
+ 
+     DISPLAY_DEBUG(display, "update monitor area");
++#ifdef G_OS_WIN32
++    if (d->remote_monitor_set) {
++        if (d->remote_monitor_x + d->remote_monitor_w > d->canvas.width ||
++            d->remote_monitor_y + d->remote_monitor_h > d->canvas.height) {
++            set_monitor_ready(display, false);
++            return;
++        }
++        update_area(display, d->remote_monitor_x, d->remote_monitor_y,
++                    d->remote_monitor_w, d->remote_monitor_h);
++        set_monitor_ready(display, true);
++        spice_d3d11_queue(display);
++        return;
++    }
++#endif
+     if (d->monitor_id < 0)
+         goto whole;
+ 
+@@ -395,6 +424,24 @@
+     case PROP_CHANNEL_ID:
+         d->channel_id = g_value_get_int(value);
+         break;
++    case PROP_REMOTE_MONITOR:
++#ifdef G_OS_WIN32
++        {
++            GVariant *region = g_value_get_variant(value);
++            gint x = 0, y = 0, w = 0, h = 0, input_id = 0;
++            if (region) g_variant_get(region, "(iiiii)", &x, &y, &w, &h, &input_id);
++            if (region && (x < 0 || y < 0 || w < 1 || h < 1 || x > 8192 - w || y > 8192 - h || input_id < 0 || input_id > 255)) {
++                g_warning("Invalid remote monitor rectangle");
++                break;
++            }
++            d->remote_monitor_set = region != NULL;
++            d->remote_monitor_x = x; d->remote_monitor_y = y;
++            d->remote_monitor_w = w; d->remote_monitor_h = h;
++            d->remote_input_id = input_id;
++            if (d->display) spice_display_widget_update_monitor_area(display);
++        }
++#endif
++        break;
+     case PROP_MONITOR_ID:
+         d->monitor_id = g_value_get_int(value);
+         if (d->display) /* if constructed */
+@@ -459,6 +506,10 @@
+     SpiceDisplayPrivate *d = display->priv;
+ 
+     DISPLAY_DEBUG(display, "spice display dispose");
++
++#ifdef G_OS_WIN32
++    spice_d3d11_destroy(display);
++#endif
+ 
+     spice_cairo_image_destroy(display);
+     g_clear_object(&d->session);
+@@ -1507,7 +1558,12 @@
+         d->area.width == 0 || d->area.height == 0)
+         return false;
+ 
+-    spice_cairo_draw_event(display, cr);
++#ifdef G_OS_WIN32
++    if (spice_d3d11_enabled())
++        spice_d3d11_queue(display);
++    else
++#endif
++        spice_cairo_draw_event(display, cr);
+     update_mouse_pointer(display);
+ 
+     return true;
+@@ -2146,6 +2202,12 @@
+     case SPICE_MOUSE_MODE_CLIENT:
+         if (x >= 0 && x < d->area.width &&
+             y >= 0 && y < d->area.height) {
++#ifdef G_OS_WIN32
++            if (d->remote_monitor_set) { x += d->remote_monitor_x; y += d->remote_monitor_y; }
++            if (g_strcmp0(g_getenv("SPICE_DX_INPUT_TRACE"), "1") == 0)
++                g_message("DX-INPUT: window=%.1f,%.1f atlas=%d,%d display=%d",
++                          motion->x, motion->y, x, y, get_display_id(display));
++#endif
+             spice_inputs_channel_position(d->inputs, x, y, get_display_id(display),
+                                           button_mask_gdk_to_spice(motion->state));
+         }
+@@ -2316,6 +2378,7 @@
+     update_mouse_cursor(display);
+ 
+ #ifdef G_OS_WIN32
++    spice_d3d11_queue(display);
+     if (d->mouse_grab_active) {
+         try_mouse_ungrab(display);
+         try_mouse_grab(display);
+@@ -2350,6 +2413,9 @@
+ {
+     SpiceDisplay *display = SPICE_DISPLAY(widget);
+ 
++#ifdef G_OS_WIN32
++    spice_d3d11_destroy(display);
++#endif
+     spice_cairo_image_destroy(display);
+ #ifdef HAVE_EGL
+     if (display->priv->egl.context_ready) {
+@@ -2566,6 +2632,10 @@
+                           G_PARAM_CONSTRUCT |
+                           G_PARAM_STATIC_STRINGS));
+ 
++    g_object_class_install_property(gobject_class, PROP_REMOTE_MONITOR,
++        g_param_spec_variant("remote-monitor", "Remote monitor", "Desktop region (x,y,width,height)",
++            G_VARIANT_TYPE("(iiiii)"), NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
+     /**
+      * SpiceDisplay::mouse-grab:
+      * @display: the #SpiceDisplay that emitted the signal
+@@ -2962,6 +3032,13 @@
+     if (d->canvas.convert)
+         do_color_convert(display, &rect);
+ 
++#ifdef G_OS_WIN32
++    if (spice_d3d11_enabled()) {
++        spice_d3d11_queue(display);
++        return;
++    }
++#endif
++
+     scale_factor = gtk_widget_get_scale_factor(GTK_WIDGET(display));
+     spice_display_get_scaling(display, &s,
+                               &display_x, &display_y,
+@@ -3218,6 +3295,13 @@
+ 
+     if (!d->ready || !d->monitor_ready)
+         return;
++
++#ifdef G_OS_WIN32
++    if (spice_d3d11_enabled()) {
++        spice_d3d11_queue(display);
++        return;
++    }
++#endif
+ 
+     spice_display_get_scaling(display, &s, &x, &y, NULL, NULL);
+     scale_factor = gtk_widget_get_scale_factor(GTK_WIDGET(display));
+@@ -3593,6 +3677,11 @@
+     g_return_val_if_fail(d != NULL, NULL);
+     g_return_val_if_fail(d->display != NULL, NULL);
+ 
++#ifdef G_OS_WIN32
++    if (spice_decode_enabled())
++        return spice_decode_snapshot(display);
++#endif
++
+ #ifdef HAVE_EGL
+     if (egl_enabled(d)) {
+         GdkPixbuf *tmp;
+--- a/src/usb-backend.c
++++ b/src/usb-backend.c
+@@ -214,7 +214,7 @@
+     return num_changed;
+ }
+ 
+-static LRESULT subclass_proc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
++static LRESULT CALLBACK subclass_proc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
+                              UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+ {
+     SpiceUsbBackend *be = (SpiceUsbBackend *)dwRefData;
+--- /dev/null
++++ b/src/spice-widget-d3d11.c
+@@ -0,0 +1,371 @@
++/* Windows desktop presenter. SPDX-License-Identifier: LGPL-2.1-or-later */
++#define COBJMACROS
++#include "config.h"
++#include <initguid.h>
++#include <d3d11.h>
++#include <dxgi1_3.h>
++#include <d3dcompiler.h>
++#include <gdk/gdkwin32.h>
++#include "spice-widget-priv.h"
++#include "spice-gtk-session-priv.h"
++#include "spice-latency-priv.h"
++
++#define RELEASE(p) do { if (p) { IUnknown_Release((IUnknown *)(p)); (p) = NULL; } } while (0)
++#define DX_TRY(expr) do { HRESULT hr_ = (expr); if (FAILED(hr_)) { \
++    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "%s failed (0x%08lx)", \
++                #expr, (unsigned long)hr_); goto fail; } } while (0)
++
++typedef struct SpiceD3D11 {
++    HWND window;
++    ID3D11Device *device;
++    ID3D11DeviceContext *context;
++    IDXGISwapChain1 *swap;
++    HANDLE ready;
++    ID3D11RenderTargetView *target;
++    ID3D11VertexShader *vs;
++    ID3D11PixelShader *ps;
++    ID3D11SamplerState *sampler;
++    ID3D11BlendState *blend;
++    ID3D11Texture2D *desktop;
++    ID3D11ShaderResourceView *desktop_view;
++    ID3D11Texture2D *cursor;
++    ID3D11ShaderResourceView *cursor_view;
++    guint scheduled;
++    guint64 frames;
++    gboolean retry;
++    gint width, height, tex_width, tex_height, cursor_width, cursor_height;
++    gchar *base_title;
++    gchar *last_status;
++    gint64 last_traced_frame;
++} SpiceD3D11;
++
++gboolean spice_d3d11_enabled(void)
++{
++    return g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0;
++}
++
++/* Hit testing stays in the GTK parent, which already implements SPICE input. */
++static LRESULT CALLBACK output_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
++{
++    if (msg == WM_NCHITTEST)
++        return HTTRANSPARENT;
++    if (msg == WM_ERASEBKGND)
++        return 1;
++    return DefWindowProcW(hwnd, msg, wp, lp);
++}
++
++void spice_d3d11_destroy(SpiceDisplay *display)
++{
++    spice_decode_destroy(display);
++    SpiceD3D11 *dx = display->priv->dx;
++    if (!dx)
++        return;
++    display->priv->dx = NULL;
++    if (dx->scheduled)
++        g_source_remove(dx->scheduled);
++    if (dx->context)
++        ID3D11DeviceContext_ClearState(dx->context);
++    RELEASE(dx->desktop_view); RELEASE(dx->desktop);
++    RELEASE(dx->cursor_view); RELEASE(dx->cursor);
++    RELEASE(dx->target); RELEASE(dx->blend); RELEASE(dx->sampler);
++    RELEASE(dx->vs); RELEASE(dx->ps); RELEASE(dx->swap);
++    if (dx->ready)
++        CloseHandle(dx->ready);
++    RELEASE(dx->context); RELEASE(dx->device);
++    if (dx->window)
++        DestroyWindow(dx->window);
++    g_free(dx->base_title);
++    g_free(dx->last_status);
++    g_free(dx);
++}
++
++static gboolean initialize(SpiceD3D11 *dx, HWND parent, GError **error)
++{
++    static const WCHAR class_name[] = L"SpiceD3D11Output";
++    WNDCLASSW wc = {0};
++    IDXGIDevice *gd = NULL;
++    IDXGIAdapter *adapter = NULL;
++    IDXGIFactory2 *factory = NULL;
++    IDXGISwapChain2 *swap2 = NULL;
++    ID3DBlob *vs = NULL, *ps = NULL, *messages = NULL;
++    DXGI_ADAPTER_DESC adapter_desc;
++    DXGI_SWAP_CHAIN_DESC1 desc = {0};
++    D3D11_SAMPLER_DESC sampler = {0};
++    D3D11_BLEND_DESC blend = {0};
++    gboolean ok = FALSE;
++    const char *shader =
++        "struct V { float4 p:SV_POSITION; float2 uv:TEXCOORD0; };"
++        "V vs_main(uint id:SV_VertexID) { V o;"
++        "float2 u=float2((id<<1)&2,id&2); o.uv=u;"
++        "o.p=float4(u.x*2-1,1-u.y*2,0,1); return o; }"
++        "Texture2D tex:register(t0); SamplerState ss:register(s0);"
++        "float4 ps_main(V i):SV_TARGET { return tex.Sample(ss,i.uv); }";
++
++    wc.lpfnWndProc = output_proc;
++    wc.hInstance = GetModuleHandleW(NULL);
++    wc.lpszClassName = class_name;
++    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
++        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Cannot register DX output window");
++        goto fail;
++    }
++    dx->window = CreateWindowExW(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, class_name, L"",
++                                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
++                                0, 0, 1, 1, parent, NULL, wc.hInstance, NULL);
++    if (!dx->window) {
++        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Cannot create DX output window");
++        goto fail;
++    }
++    SetWindowLongPtrW(parent, GWL_STYLE, GetWindowLongPtrW(parent, GWL_STYLE) | WS_CLIPCHILDREN);
++    DX_TRY(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
++                            D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION,
++                            &dx->device, NULL, &dx->context));
++    DX_TRY(ID3D11Device_QueryInterface(dx->device, &IID_IDXGIDevice, (void **)&gd));
++    DX_TRY(IDXGIDevice_GetAdapter(gd, &adapter));
++    DX_TRY(IDXGIAdapter_GetDesc(adapter, &adapter_desc));
++    DX_TRY(IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory2, (void **)&factory));
++    desc.Width = desc.Height = 1;
++    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    desc.SampleDesc.Count = 1;
++    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++    desc.BufferCount = 2;
++    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++    desc.Scaling = DXGI_SCALING_STRETCH;
++    desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
++    DX_TRY(IDXGIFactory2_CreateSwapChainForHwnd(factory, (IUnknown *)dx->device,
++                                               dx->window, &desc, NULL, NULL, &dx->swap));
++    DX_TRY(IDXGIFactory2_MakeWindowAssociation(factory, dx->window, DXGI_MWA_NO_ALT_ENTER));
++    DX_TRY(IDXGISwapChain1_QueryInterface(dx->swap, &IID_IDXGISwapChain2, (void **)&swap2));
++    DX_TRY(IDXGISwapChain2_SetMaximumFrameLatency(swap2, 1));
++    dx->ready = IDXGISwapChain2_GetFrameLatencyWaitableObject(swap2);
++    if (!dx->ready) {
++        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, "DXGI waitable object unavailable");
++        goto fail;
++    }
++    DX_TRY(D3DCompile(shader, strlen(shader), "spice-dx", NULL, NULL, "vs_main", "vs_4_0",
++                      D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs, &messages));
++    RELEASE(messages);
++    DX_TRY(D3DCompile(shader, strlen(shader), "spice-dx", NULL, NULL, "ps_main", "ps_4_0",
++                      D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps, &messages));
++    DX_TRY(ID3D11Device_CreateVertexShader(dx->device, ID3D10Blob_GetBufferPointer(vs),
++                                          ID3D10Blob_GetBufferSize(vs), NULL, &dx->vs));
++    DX_TRY(ID3D11Device_CreatePixelShader(dx->device, ID3D10Blob_GetBufferPointer(ps),
++                                         ID3D10Blob_GetBufferSize(ps), NULL, &dx->ps));
++    sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
++    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
++    sampler.MaxLOD = D3D11_FLOAT32_MAX;
++    DX_TRY(ID3D11Device_CreateSamplerState(dx->device, &sampler, &dx->sampler));
++    blend.RenderTarget[0].BlendEnable = TRUE;
++    blend.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
++    blend.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
++    blend.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
++    blend.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
++    blend.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
++    blend.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
++    blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
++    DX_TRY(ID3D11Device_CreateBlendState(dx->device, &blend, &dx->blend));
++    gchar *description = g_utf16_to_utf8((gunichar2 *)adapter_desc.Description, -1, NULL, NULL, NULL);
++    g_message("DX-H264: renderer=D3D11 adapter=%s vendor=%04x device=%04x "
++              "luid=%08lx:%08lx swap=FLIP_DISCARD buffers=2 max-latency=1",
++              description, adapter_desc.VendorId, adapter_desc.DeviceId,
++              (unsigned long)adapter_desc.AdapterLuid.HighPart,
++              (unsigned long)adapter_desc.AdapterLuid.LowPart);
++    g_free(description);
++    ok = TRUE;
++fail:
++    RELEASE(messages); RELEASE(vs); RELEASE(ps); RELEASE(swap2);
++    RELEASE(factory); RELEASE(adapter); RELEASE(gd);
++    return ok;
++}
++
++static gboolean texture(SpiceD3D11 *dx, gint width, gint height, DXGI_FORMAT format,
++                        ID3D11Texture2D **tex, ID3D11ShaderResourceView **view, GError **error)
++{
++    D3D11_TEXTURE2D_DESC desc = {0};
++    RELEASE(*view); RELEASE(*tex);
++    desc.Width = width; desc.Height = height;
++    desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
++    desc.Format = format;
++    desc.Usage = D3D11_USAGE_DEFAULT;
++    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++    DX_TRY(ID3D11Device_CreateTexture2D(dx->device, &desc, NULL, tex));
++    DX_TRY(ID3D11Device_CreateShaderResourceView(dx->device, (ID3D11Resource *)*tex, NULL, view));
++    return TRUE;
++fail:
++    return FALSE;
++}
++
++static void draw_texture(SpiceD3D11 *dx, ID3D11ShaderResourceView *view,
++                         float x, float y, float width, float height)
++{
++    D3D11_VIEWPORT vp = { x, y, width, height, 0, 1 };
++    ID3D11DeviceContext_RSSetViewports(dx->context, 1, &vp);
++    ID3D11DeviceContext_PSSetShaderResources(dx->context, 0, 1, &view);
++    ID3D11DeviceContext_Draw(dx->context, 3, 0);
++    view = NULL;
++    ID3D11DeviceContext_PSSetShaderResources(dx->context, 0, 1, &view);
++}
++
++static gboolean render(SpiceDisplay *display, GError **error)
++{
++    SpiceDisplayPrivate *d = display->priv;
++    SpiceD3D11 *dx = d->dx;
++    GtkWidget *area = gtk_stack_get_child_by_name(d->stack, "draw-area");
++    GdkWindow *window = gtk_widget_get_window(area);
++    ID3D11Texture2D *backbuffer = NULL;
++    gint factor, width, height, x, y, image_width, image_height;
++    double scale;
++    DWORD wait;
++    const FLOAT black[4] = {0, 0, 0, 1};
++    dx->retry = FALSE;
++    if (!window || !gtk_widget_get_mapped(area) || !d->canvas.data ||
++        !d->mark || d->area.width <= 0 || d->area.height <= 0)
++        return TRUE;
++    if (!dx->device && !initialize(dx, GDK_WINDOW_HWND(window), error))
++        return FALSE;
++    const gchar *status = d->display ? g_object_get_data(G_OBJECT(d->display), "dx-video-status") : NULL;
++    GtkWidget *top = gtk_widget_get_toplevel(GTK_WIDGET(display));
++    if (GTK_IS_WINDOW(top) && g_strcmp0(dx->last_status, status) != 0) {
++        if (!dx->base_title)
++            dx->base_title = g_strdup(gtk_window_get_title(GTK_WINDOW(top)));
++        gchar *title = g_strdup_printf("%s [DX11 | %s]", dx->base_title ? dx->base_title : "SPICE",
++                                       status ? status : "H.264 requested");
++        gtk_window_set_title(GTK_WINDOW(top), title);
++        g_free(title);
++        g_free(dx->last_status);
++        dx->last_status = g_strdup(status);
++    }
++    if (d->display && g_object_get_data(G_OBJECT(d->display), "dx-video-error")) {
++        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED,
++                            status ? status : "H.264 negotiation/decoding failed");
++        return FALSE;
++    }
++    factor = gtk_widget_get_scale_factor(area);
++    width = gtk_widget_get_allocated_width(area) * factor;
++    height = gtk_widget_get_allocated_height(area) * factor;
++    if (width < 1 || height < 1)
++        return TRUE;
++    if (dx->width != width || dx->height != height) {
++        ID3D11DeviceContext_OMSetRenderTargets(dx->context, 0, NULL, NULL);
++        RELEASE(dx->target);
++        SetWindowPos(dx->window, NULL, 0, 0, width, height, SWP_NOACTIVATE | SWP_NOZORDER);
++        DX_TRY(IDXGISwapChain1_ResizeBuffers(dx->swap, 2, width, height,
++                                             DXGI_FORMAT_UNKNOWN,
++                                             DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT));
++        DX_TRY(IDXGISwapChain1_GetBuffer(dx->swap, 0, &IID_ID3D11Texture2D, (void **)&backbuffer));
++        DX_TRY(ID3D11Device_CreateRenderTargetView(dx->device, (ID3D11Resource *)backbuffer,
++                                                  NULL, &dx->target));
++        RELEASE(backbuffer);
++        dx->width = width; dx->height = height;
++    }
++    wait = WaitForSingleObject(dx->ready, 0);
++    if (wait == WAIT_TIMEOUT) {
++        dx->retry = TRUE;
++        return TRUE; /* caller schedules one retry; UI thread never blocks */
++    }
++    if (wait != WAIT_OBJECT_0) {
++        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, "DXGI frame wait failed");
++        return FALSE;
++    }
++    if (dx->tex_width != d->area.width || dx->tex_height != d->area.height) {
++        if (!texture(dx, d->area.width, d->area.height, DXGI_FORMAT_B8G8R8A8_UNORM,
++                     &dx->desktop, &dx->desktop_view, error))
++            return FALSE;
++        dx->tex_width = d->area.width; dx->tex_height = d->area.height;
++    }
++    gint stride = d->canvas.convert ? d->area.width * 4 : d->canvas.stride;
++    const guint8 *pixels = d->canvas.data;
++    if (!d->canvas.convert)
++        pixels += (gssize)d->area.y * stride + d->area.x * 4;
++    /* Canvas is borrowed only during UpdateSubresource; never retain its pointer. */
++    ID3D11DeviceContext_UpdateSubresource(dx->context, (ID3D11Resource *)dx->desktop,
++                                         0, NULL, pixels, stride, 0);
++    ID3D11DeviceContext_OMSetRenderTargets(dx->context, 1, &dx->target, NULL);
++    ID3D11DeviceContext_ClearRenderTargetView(dx->context, dx->target, black);
++    ID3D11DeviceContext_IASetPrimitiveTopology(dx->context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    ID3D11DeviceContext_VSSetShader(dx->context, dx->vs, NULL, 0);
++    ID3D11DeviceContext_PSSetShader(dx->context, dx->ps, NULL, 0);
++    ID3D11DeviceContext_PSSetSamplers(dx->context, 0, 1, &dx->sampler);
++    ID3D11DeviceContext_OMSetBlendState(dx->context, NULL, NULL, 0xffffffff);
++    spice_display_get_scaling(display, &scale, &x, &y, &image_width, &image_height);
++    draw_texture(dx, dx->desktop_view, x, y, image_width, image_height);
++    if (d->mouse_mode == SPICE_MOUSE_MODE_SERVER && d->mouse_guest_x != -1 &&
++        d->mouse_guest_y != -1 && !d->show_cursor && d->mouse_pixbuf &&
++        spice_gtk_session_get_pointer_grabbed(d->gtk_session)) {
++        gint cw = gdk_pixbuf_get_width(d->mouse_pixbuf), ch = gdk_pixbuf_get_height(d->mouse_pixbuf);
++        if (dx->cursor_width != cw || dx->cursor_height != ch) {
++            if (!texture(dx, cw, ch, DXGI_FORMAT_R8G8B8A8_UNORM, &dx->cursor, &dx->cursor_view, error))
++                return FALSE;
++            dx->cursor_width = cw; dx->cursor_height = ch;
++        }
++        ID3D11DeviceContext_UpdateSubresource(dx->context, (ID3D11Resource *)dx->cursor, 0,
++                                             NULL, gdk_pixbuf_get_pixels(d->mouse_pixbuf),
++                                             gdk_pixbuf_get_rowstride(d->mouse_pixbuf), 0);
++        ID3D11DeviceContext_OMSetBlendState(dx->context, dx->blend, NULL, 0xffffffff);
++        draw_texture(dx, dx->cursor_view,
++                     x + (d->mouse_guest_x - d->mouse_hotspot.x - d->area.x) * scale,
++                     y + (d->mouse_guest_y - d->mouse_hotspot.y - d->area.y) * scale,
++                     cw * scale, ch * scale);
++    }
++    /* Keep tearing disabled. Waitable scheduling limits outstanding presents. */
++    DX_TRY(IDXGISwapChain1_Present(dx->swap, 1, 0));
++    if (++dx->frames == 1)
++        g_message("DX-H264: first desktop frame presented via DXGI; CPU canvas upload, not zero-copy");
++    SpiceDxLatencyFrame *trace = d->display ? g_object_get_data(G_OBJECT(d->display), "dx-latency-frame") : NULL;
++    if (trace && trace->received_us != dx->last_traced_frame) {
++        gint64 now = g_get_monotonic_time();
++        dx->last_traced_frame = trace->received_us;
++        g_message("DX-LATENCY marker=%d wall_us=%" G_GINT64_FORMAT
++                  " decode_us=%" G_GINT64_FORMAT " hold_us=%" G_GINT64_FORMAT
++                  " draw_us=%" G_GINT64_FORMAT " client_us=%" G_GINT64_FORMAT
++                  " parse_us=%" G_GINT64_FORMAT " hardware_us=%" G_GINT64_FORMAT " download_us=%" G_GINT64_FORMAT,
++                  trace->marker_valid ? (gint)trace->marker : -1, g_get_real_time(),
++                  trace->decoded_us - trace->received_us,
++                  trace->composed_us - trace->decoded_us, now - trace->composed_us,
++                  now - trace->received_us, trace->parsed_us - trace->received_us,
++                  trace->hardware_us - trace->parsed_us, trace->decoded_us - trace->hardware_us);
++    }
++    return TRUE;
++fail:
++    RELEASE(backbuffer);
++    return FALSE;
++}
++
++static gboolean redraw(gpointer data)
++{
++    SpiceDisplay *display = SPICE_DISPLAY(data);
++    SpiceDisplayPrivate *d = display->priv;
++    GError *error = NULL;
++    d->dx->scheduled = 0;
++    if (!render(display, &error)) {
++        gchar *text = g_strdup_printf("DX / H.264 failed: %s\nNo alternate backend was selected.",
++                                      error ? error->message : "unknown error");
++        g_warning("%s", text);
++        spice_d3d11_destroy(display);
++        d->dx_failed = TRUE;
++        gtk_label_set_text(GTK_LABEL(d->label), text);
++        gtk_stack_set_visible_child_name(d->stack, "label");
++        g_free(text);
++        g_clear_error(&error);
++    } else if (d->dx->retry &&
++               gtk_widget_get_mapped(GTK_WIDGET(display))) {
++        d->dx->scheduled = g_timeout_add_full(G_PRIORITY_DEFAULT, 4, redraw,
++                                              g_object_ref(display), g_object_unref);
++    }
++    return G_SOURCE_REMOVE;
++}
++
++void spice_d3d11_queue(SpiceDisplay *display)
++{
++    SpiceDisplayPrivate *d = display->priv;
++    if (spice_decode_enabled()) {
++        spice_decode_layout(display);
++        return;
++    }
++    if (!spice_d3d11_enabled() || d->dx_failed)
++        return;
++    if (!d->dx)
++        d->dx = g_new0(SpiceD3D11, 1);
++    if (!d->dx->scheduled)
++        d->dx->scheduled = g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, redraw,
++                                          g_object_ref(display), g_object_unref);
++}
+--- /dev/null
++++ b/src/spice-widget-decode.cpp
+@@ -0,0 +1,376 @@
++/* Decoder NV12 -> video processor -> swapchain. SPDX-License-Identifier: LGPL-2.1-or-later */
++#include "config.h"
++#define SPICE_COMPILATION
++#define GST_USE_UNSTABLE_API
++#define G_LOG_DOMAIN "GSpice"
++#include <windows.h>
++#include <initguid.h>
++#include <dxgi1_3.h>
++#include <d3d11_1.h>
++#include <gst/d3d11/gstd3d11.h>
++#include <gst/video/video.h>
++#include <gdk/gdkwin32.h>
++#include "spice-widget-priv.h"
++#include "spice-direct-priv.h"
++
++#define RELEASE(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
++#define CHECK(call) do { HRESULT result = (call); if (FAILED(result)) { \
++    g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "%s: 0x%08lx", \
++                #call, (unsigned long)result); return FALSE; } } while (0)
++
++struct SpiceDecodePresenter {
++    HWND window = nullptr;
++    SpiceDirectBinding *binding = nullptr;
++    SpiceDirectHub *hub = nullptr;
++    SpiceDisplayChannel *channel = nullptr;
++    GstD3D11Device *device = nullptr;
++    IDXGISwapChain1 *swap = nullptr;
++    ID3D11VideoDevice *video_device = nullptr;
++    ID3D11VideoContext *video_context = nullptr;
++    ID3D11VideoProcessorEnumerator *enumerator = nullptr;
++    ID3D11VideoProcessor *processor = nullptr;
++    GstSample *latest = nullptr;
++    gint width = 1, height = 1;
++    gint crop_x = 0, crop_y = 0, crop_w = 0, crop_h = 0;
++    gint buffer_width = 0, buffer_height = 0, source_width = 0, source_height = 0;
++    guint64 presented = 0, busy = 0;
++    guint64 attempts = 0;
++    bool failed = false;
++    gchar *base_title = nullptr;
++    void release_device() {
++        if (device) gst_d3d11_device_lock(device);
++        RELEASE(processor); RELEASE(enumerator); RELEASE(video_context);
++        RELEASE(video_device); RELEASE(swap);
++        if (device) gst_d3d11_device_unlock(device);
++        g_clear_pointer(&latest, gst_sample_unref);
++        gst_clear_object(&device);
++        buffer_width = buffer_height = source_width = source_height = 0;
++    }
++    ~SpiceDecodePresenter() {
++        release_device();
++        g_clear_object(&channel);
++        g_free(base_title);
++    }
++};
++
++static LRESULT CALLBACK decode_window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
++{
++    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
++    if (msg == WM_ERASEBKGND) return 1;
++    return DefWindowProcW(hwnd, msg, wp, lp);
++}
++
++static gboolean initialize_swap(SpiceDecodePresenter *p, GstD3D11Memory *mem, GError **error)
++{
++    ID3D11Device *device = gst_d3d11_device_get_device_handle(mem->device);
++    IDXGIDevice1 *dxgi = nullptr;
++    IDXGIAdapter *adapter = nullptr;
++    IDXGIFactory2 *factory = nullptr;
++    struct Locals {
++        IDXGIDevice1 *&d; IDXGIAdapter *&a; IDXGIFactory2 *&f;
++        ~Locals() { RELEASE(f); RELEASE(a); RELEASE(d); }
++    } locals {dxgi, adapter, factory};
++    CHECK(device->QueryInterface(__uuidof(IDXGIDevice1), (void **)&dxgi));
++    CHECK(dxgi->GetAdapter(&adapter));
++    CHECK(adapter->GetParent(__uuidof(IDXGIFactory2), (void **)&factory));
++    DXGI_SWAP_CHAIN_DESC1 desc = {};
++    desc.Width = MAX(g_atomic_int_get(&p->width), 1);
++    desc.Height = MAX(g_atomic_int_get(&p->height), 1);
++    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    desc.SampleDesc.Count = 1;
++    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++    desc.BufferCount = 2;
++    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++    desc.Scaling = DXGI_SCALING_STRETCH;
++    /* Each view needs its own single-frame limit. A device-wide limit of one
++     * lets the first view consume every Present slot and starves other views. */
++    desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
++    CHECK(factory->CreateSwapChainForHwnd(device, p->window, &desc, nullptr, nullptr, &p->swap));
++    IDXGISwapChain2 *swap2 = nullptr;
++    CHECK(p->swap->QueryInterface(__uuidof(IDXGISwapChain2), (void **)&swap2));
++    HRESULT latency_result = swap2->SetMaximumFrameLatency(1);
++    swap2->Release();
++    CHECK(latency_result);
++    CHECK(factory->MakeWindowAssociation(p->window, DXGI_MWA_NO_ALT_ENTER));
++    CHECK(device->QueryInterface(__uuidof(ID3D11VideoDevice), (void **)&p->video_device));
++    CHECK(gst_d3d11_device_get_device_context_handle(mem->device)->QueryInterface(
++        __uuidof(ID3D11VideoContext), (void **)&p->video_context));
++    p->device = (GstD3D11Device *)gst_object_ref(mem->device);
++    p->buffer_width = desc.Width; p->buffer_height = desc.Height;
++    D3D11_TEXTURE2D_DESC input;
++    gst_d3d11_memory_get_texture_desc(mem, &input);
++    g_message("DX-DIRECT: same-device NV12 decoder texture=%p bind=0x%x array=%u; "
++              "VideoProcessorBlt directly into BGRA swapchain; CPU copies=0; video timers=0",
++              gst_d3d11_memory_get_resource_handle(mem), input.BindFlags, input.ArraySize);
++    return TRUE;
++}
++
++static gboolean present_sample_impl(SpiceDecodePresenter *p, GstSample *sample, GError **error)
++{
++    /* An occluded secondary window must not pin an old decoder surface. Only
++     * the primary view supplies history thumbnails, and keeps at most one. */
++    g_clear_pointer(&p->latest, gst_sample_unref);
++    if (!IsWindowVisible(p->window) || IsIconic(GetAncestor(p->window, GA_ROOT)))
++        return TRUE;
++    GstBuffer *buffer = gst_sample_get_buffer(sample);
++    if (gst_buffer_n_memory(buffer) != 1 ||
++        !gst_is_d3d11_memory(gst_buffer_peek_memory(buffer, 0))) {
++        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Expected native D3D11 memory");
++        return FALSE;
++    }
++    auto *mem = (GstD3D11Memory *)gst_buffer_peek_memory(buffer, 0);
++    GstVideoInfo info;
++    D3D11_TEXTURE2D_DESC input;
++    gst_d3d11_memory_get_texture_desc(mem, &input);
++    if (input.Format != DXGI_FORMAT_NV12 || !(input.BindFlags & D3D11_BIND_DECODER) ||
++        !gst_video_info_from_caps(&info, gst_sample_get_caps(sample))) {
++        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Expected NV12 decoder output texture");
++        return FALSE;
++    }
++    if (p->device && p->device != mem->device) {
++        /* Resizing the remote atlas recreates the decoder and its D3D device.
++         * Rebind this window to that device, keeping the same direct GPU path. */
++        p->release_device();
++        p->failed = false;
++        p->presented = 0;
++        g_message("DX-DIRECT: rebinding swapchain after decoder recreation");
++    }
++    if (p->failed) return TRUE;
++    if (p->crop_w && (p->crop_x + p->crop_w > info.width || p->crop_y + p->crop_h > info.height))
++        return TRUE; // Wait for the resized desktop stream, never show the wrong region.
++    /* Same immediate context orders VP reads before later decoder writes when
++     * this sample returns to its pool. No CPU wait or staging copy is needed. */
++    gst_d3d11_device_lock(mem->device);
++    struct Unlock { GstD3D11Device *d; ~Unlock() { gst_d3d11_device_unlock(d); } } unlock {mem->device};
++    if (!p->swap && !initialize_swap(p, mem, error)) return FALSE;
++    gint width = MAX(g_atomic_int_get(&p->width), 1);
++    gint height = MAX(g_atomic_int_get(&p->height), 1);
++    if (width != p->buffer_width || height != p->buffer_height) {
++        CHECK(p->swap->ResizeBuffers(2, width, height, DXGI_FORMAT_UNKNOWN,
++                                    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT));
++        p->buffer_width = width; p->buffer_height = height;
++        RELEASE(p->processor); RELEASE(p->enumerator);
++    }
++    if (!p->processor || p->source_width != info.width || p->source_height != info.height) {
++        RELEASE(p->processor); RELEASE(p->enumerator);
++        D3D11_VIDEO_PROCESSOR_CONTENT_DESC content = {};
++        content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
++        content.InputWidth = info.width; content.InputHeight = info.height;
++        content.OutputWidth = width; content.OutputHeight = height;
++        content.InputFrameRate = {60, 1}; content.OutputFrameRate = {60, 1};
++        content.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
++        CHECK(p->video_device->CreateVideoProcessorEnumerator(&content, &p->enumerator));
++        CHECK(p->video_device->CreateVideoProcessor(p->enumerator, 0, &p->processor));
++        p->video_context->VideoProcessorSetStreamAutoProcessingMode(p->processor, 0, FALSE);
++        p->video_context->VideoProcessorSetStreamFrameFormat(p->processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
++        p->source_width = info.width; p->source_height = info.height;
++    }
++    ID3D11Texture2D *backbuffer = nullptr;
++    ID3D11VideoProcessorInputView *iv = nullptr;
++    ID3D11VideoProcessorOutputView *ov = nullptr;
++    struct Views {
++        ID3D11Texture2D *&b; ID3D11VideoProcessorInputView *&i; ID3D11VideoProcessorOutputView *&o;
++        ~Views() { RELEASE(o); RELEASE(i); RELEASE(b); }
++    } views {backbuffer, iv, ov};
++    CHECK(p->swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&backbuffer));
++    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC id = {};
++    id.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
++    id.Texture2D.ArraySlice = gst_d3d11_memory_get_subresource_index(mem);
++    CHECK(p->video_device->CreateVideoProcessorInputView(gst_d3d11_memory_get_resource_handle(mem),
++        p->enumerator, &id, &iv));
++    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC od = {};
++    od.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
++    CHECK(p->video_device->CreateVideoProcessorOutputView(backbuffer, p->enumerator, &od, &ov));
++    RECT source = {p->crop_x, p->crop_y,
++        p->crop_w ? p->crop_x + p->crop_w : (LONG)info.width,
++        p->crop_h ? p->crop_y + p->crop_h : (LONG)info.height};
++    RECT dest = {0, 0, width, height};
++    p->video_context->VideoProcessorSetStreamSourceRect(p->processor, 0, TRUE, &source);
++    p->video_context->VideoProcessorSetStreamDestRect(p->processor, 0, TRUE, &dest);
++    p->video_context->VideoProcessorSetOutputTargetRect(p->processor, TRUE, &dest);
++    D3D11_VIDEO_PROCESSOR_COLOR_SPACE in_color = {}, out_color = {};
++    in_color.YCbCr_Matrix = info.colorimetry.matrix == GST_VIDEO_COLOR_MATRIX_BT709;
++    in_color.Nominal_Range = info.colorimetry.range == GST_VIDEO_COLOR_RANGE_0_255 ? 2 : 1;
++    out_color.RGB_Range = 0; out_color.Nominal_Range = 2;
++    p->video_context->VideoProcessorSetStreamColorSpace(p->processor, 0, &in_color);
++    p->video_context->VideoProcessorSetOutputColorSpace(p->processor, &out_color);
++    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
++    stream.Enable = TRUE; stream.pInputSurface = iv;
++    CHECK(p->video_context->VideoProcessorBlt(p->processor, ov, 0, 1, &stream));
++    HRESULT hr = p->swap->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
++    if (hr == DXGI_ERROR_WAS_STILL_DRAWING || hr == DXGI_STATUS_OCCLUDED) {
++        ++p->busy; // Discard this decoded presentation; never schedule a timer retry.
++        return TRUE;
++    }
++    CHECK(hr);
++    if (p->crop_x == 0 && p->crop_y == 0)
++        p->latest = gst_sample_ref(sample);
++    if (++p->presented == 1) {
++        g_message("DX-DIRECT: first GPU frame presented; NV12->BGRA on GPU; no CPU canvas; Present(0)");
++        g_object_set_data_full(G_OBJECT(p->channel), "dx-video-status", g_strdup("H.264 decoded"), g_free);
++    }
++    if (p->presented % 600 == 0)
++        g_message("DX-DIRECT: view=%d,%d presented=%" G_GUINT64_FORMAT " busy-skipped=%" G_GUINT64_FORMAT,
++                  p->crop_x, p->crop_y, p->presented, p->busy);
++    return TRUE;
++}
++
++static gboolean present_sample(gpointer owner, GstSample *sample, GError **error)
++{
++    auto *p = (SpiceDecodePresenter *)owner;
++    guint64 before = p->presented;
++    gboolean ok = present_sample_impl(p, sample, error);
++    if (++p->attempts % 300 == 0 && g_strcmp0(g_getenv("SPICE_DX_STATS"), "1") == 0)
++        g_message("DX-VIEW-STATS: view=%d,%d samples=%" G_GUINT64_FORMAT
++                  " presented=%" G_GUINT64_FORMAT " busy=%" G_GUINT64_FORMAT " visible=%d",
++                  p->crop_x, p->crop_y, p->attempts, p->presented, p->busy,
++                  (int)IsWindowVisible(p->window));
++    p->binding->submitted = p->presented != before;
++    if (!ok) p->failed = true;
++    return ok;
++}
++
++gboolean spice_decode_enabled(void) { return spice_direct_enabled(); }
++
++void spice_decode_layout(SpiceDisplay *display)
++{
++    auto *d = display->priv;
++    if (!d->display || d->dx_failed) return;
++    GtkWidget *area = gtk_stack_get_child_by_name(d->stack, "draw-area");
++    GdkWindow *window = gtk_widget_get_window(area);
++    if (!window) return;
++    auto *p = d->decode_presenter;
++    if (!p) {
++        p = new SpiceDecodePresenter;
++        d->decode_presenter = p;
++        WNDCLASSW wc = {};
++        wc.lpfnWndProc = decode_window_proc;
++        wc.hInstance = GetModuleHandleW(nullptr);
++        wc.lpszClassName = L"SpiceDecodeOutput";
++        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
++        RegisterClassW(&wc);
++        HWND parent = (HWND)GDK_WINDOW_HWND(window);
++        p->window = CreateWindowExW(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
++            wc.lpszClassName, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
++            0, 0, 1, 1, parent, nullptr, wc.hInstance, nullptr);
++        if (!p->window) {
++            d->dx_failed = TRUE;
++            gtk_label_set_text(GTK_LABEL(d->label), "Cannot create GPU output window");
++            gtk_stack_set_visible_child_name(d->stack, "label");
++            return;
++        }
++        SetWindowLongPtrW(parent, GWL_STYLE, GetWindowLongPtrW(parent, GWL_STYLE) | WS_CLIPCHILDREN);
++        p->channel = (SpiceDisplayChannel *)g_object_ref(d->display);
++        p->binding = g_new0(SpiceDirectBinding, 1);
++        p->binding->refs = 1;
++        g_mutex_init(&p->binding->mutex);
++        p->binding->owner = p;
++        p->binding->present = present_sample;
++        p->hub = (SpiceDirectHub *)g_object_dup_data(G_OBJECT(p->channel), "dx-direct-hub",
++                                                     spice_direct_hub_ref, nullptr);
++        if (!p->hub) {
++            p->hub = g_new0(SpiceDirectHub, 1);
++            p->hub->refs = 1;
++            g_mutex_init(&p->hub->mutex);
++            p->hub->bindings = g_ptr_array_new_with_free_func(spice_direct_unref);
++            g_object_set_data_full(G_OBJECT(p->channel), "dx-direct-hub",
++                                  spice_direct_hub_ref(p->hub, nullptr), spice_direct_hub_unref);
++        }
++        g_mutex_lock(&p->hub->mutex);
++        g_ptr_array_add(p->hub->bindings, spice_direct_ref(p->binding, nullptr));
++        g_mutex_unlock(&p->hub->mutex);
++        g_message("DX-DIRECT: native window attached to display channel");
++    }
++    /* Resize HWND on its owner thread, without waiting on DXGI/device locks. */
++    double scale;
++    int x, y, width, height;
++    spice_display_get_scaling(display, &scale, &x, &y, &width, &height);
++    g_atomic_int_set(&p->width, MAX(width, 1)); g_atomic_int_set(&p->height, MAX(height, 1));
++    g_mutex_lock(&p->binding->mutex);
++    p->crop_x = d->remote_monitor_set ? d->remote_monitor_x : 0;
++    p->crop_y = d->remote_monitor_set ? d->remote_monitor_y : 0;
++    p->crop_w = d->remote_monitor_set ? d->remote_monitor_w : 0;
++    p->crop_h = d->remote_monitor_set ? d->remote_monitor_h : 0;
++    g_mutex_unlock(&p->binding->mutex);
++    SetWindowPos(p->window, nullptr, x, y, MAX(width, 1), MAX(height, 1), SWP_NOACTIVATE | SWP_NOZORDER);
++    if (g_object_get_data(G_OBJECT(p->channel), "dx-video-error")) {
++        const char *failure = (const char *)g_object_get_data(G_OBJECT(p->channel), "dx-video-status");
++        gtk_label_set_text(GTK_LABEL(d->label), failure ? failure : "GPU presentation failed");
++        gtk_stack_set_visible_child_name(d->stack, "label");
++    } else gtk_stack_set_visible_child_name(d->stack, "draw-area");
++    GtkWidget *top = gtk_widget_get_toplevel(GTK_WIDGET(display));
++    if (GTK_IS_WINDOW(top) && !p->base_title) {
++        p->base_title = g_strdup(gtk_window_get_title(GTK_WINDOW(top)));
++        gchar *title = g_strdup_printf("%s [DX | GPU Direct]", p->base_title);
++        gtk_window_set_title(GTK_WINDOW(top), title);
++        g_free(title);
++    }
++}
++
++void spice_decode_destroy(SpiceDisplay *display)
++{
++    auto *p = display->priv->decode_presenter;
++    if (!p) return;
++    display->priv->decode_presenter = nullptr;
++    auto *binding = p->binding;
++    if (binding) {
++        g_mutex_lock(&binding->mutex);
++        binding->owner = nullptr;
++        g_mutex_unlock(&binding->mutex);
++        g_mutex_lock(&p->hub->mutex);
++        g_ptr_array_remove(p->hub->bindings, binding);
++        g_mutex_unlock(&p->hub->mutex);
++        spice_direct_hub_unref(p->hub);
++    }
++    HWND window = p->window;
++    delete p;
++    if (window) DestroyWindow(window);
++    spice_direct_unref(binding);
++}
++
++GdkPixbuf *spice_decode_snapshot(SpiceDisplay *display)
++{
++    auto *p = display->priv->decode_presenter;
++    if (!p || !p->binding) return nullptr;
++    GstSample *sample = nullptr;
++    gint cx, cy, cw, ch;
++    g_mutex_lock(&p->binding->mutex);
++    if (p->latest) sample = gst_sample_ref(p->latest);
++    cx = p->crop_x; cy = p->crop_y; cw = p->crop_w; ch = p->crop_h;
++    g_mutex_unlock(&p->binding->mutex);
++    if (!sample) return nullptr;
++    /* History requests a readback every 30 seconds, never per video frame. */
++    GstVideoInfo info;
++    GstVideoFrame frame = {};
++    GdkPixbuf *result = nullptr;
++    if (gst_video_info_from_caps(&info, gst_sample_get_caps(sample)) &&
++        gst_video_frame_map(&frame, &info, gst_sample_get_buffer(sample), GST_MAP_READ)) {
++        if (!cw) cw = info.width;
++        if (!ch) ch = info.height;
++        if (cx + cw > info.width || cy + ch > info.height) {
++            gst_video_frame_unmap(&frame);
++            gst_sample_unref(sample);
++            return nullptr;
++        }
++        result = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, cw, ch);
++        auto *pixels = gdk_pixbuf_get_pixels(result);
++        int stride = gdk_pixbuf_get_rowstride(result);
++        const auto *Y = (const guint8 *)GST_VIDEO_FRAME_PLANE_DATA(&frame, 0);
++        const auto *UV = (const guint8 *)GST_VIDEO_FRAME_PLANE_DATA(&frame, 1);
++        bool limited = info.colorimetry.range != GST_VIDEO_COLOR_RANGE_0_255;
++        bool bt709 = info.colorimetry.matrix == GST_VIDEO_COLOR_MATRIX_BT709;
++        for (int y = 0; y < ch; y++) for (int x = 0; x < cw; x++) {
++            float l = Y[(y + cy) * GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0) + x + cx];
++            int ci = ((y + cy) / 2) * GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 1) + ((x + cx) & ~1);
++            float u = UV[ci] - 128.f, v = UV[ci + 1] - 128.f;
++            if (limited) { l = (l - 16.f) * (255.f / 219.f); u *= 255.f / 224.f; v *= 255.f / 224.f; }
++            auto *out = pixels + y * stride + x * 3;
++            out[0] = (guint8)CLAMP(l + (bt709 ? 1.5748f : 1.402f) * v, 0, 255);
++            out[1] = (guint8)CLAMP(l - (bt709 ? .1873f : .3441f) * u - (bt709 ? .4681f : .7141f) * v, 0, 255);
++            out[2] = (guint8)CLAMP(l + (bt709 ? 1.8556f : 1.772f) * u, 0, 255);
++        }
++        gst_video_frame_unmap(&frame);
++    }
++    gst_sample_unref(sample);
++    return result;
++}
+--- /dev/null
++++ b/src/spice-direct-priv.h
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++#include <glib-object.h>
++#include <gst/gst.h>
++
++/* Shared ABI between the GLib decoder and GTK presenter. No GTK calls are
++ * allowed from present(). The mutex also serializes HWND destruction. */
++typedef struct SpiceDirectBinding {
++    gint refs;
++    GMutex mutex;
++    gpointer owner;
++    gboolean submitted;
++    gboolean (*present)(gpointer owner, GstSample *sample, GError **error);
++} SpiceDirectBinding;
++
++typedef struct SpiceDirectHub {
++    gint refs;
++    GMutex mutex;
++    GPtrArray *bindings;
++} SpiceDirectHub;
++
++static inline gboolean spice_direct_enabled(void)
++{
++    return g_strcmp0(g_getenv("SPICE_DX_H264"), "1") == 0 &&
++           g_strcmp0(g_getenv("SPICE_DX_DIRECT"), "0") != 0 &&
++           g_strcmp0(g_getenv("SPICE_DX_LOW_LATENCY"), "0") != 0;
++}
++
++static inline gpointer spice_direct_ref(gpointer p, gpointer unused G_GNUC_UNUSED)
++{
++    if (p) g_atomic_int_inc(&((SpiceDirectBinding *)p)->refs);
++    return p;
++}
++
++static inline void spice_direct_unref(gpointer p)
++{
++    SpiceDirectBinding *b = (SpiceDirectBinding *)p;
++    if (b && g_atomic_int_dec_and_test(&b->refs)) {
++        g_mutex_clear(&b->mutex);
++        g_free(b);
++    }
++}
++
++static inline gpointer spice_direct_hub_ref(gpointer p, gpointer unused G_GNUC_UNUSED)
++{
++    if (p) g_atomic_int_inc(&((SpiceDirectHub *)p)->refs);
++    return p;
++}
++
++static inline void spice_direct_hub_unref(gpointer p)
++{
++    SpiceDirectHub *hub = (SpiceDirectHub *)p;
++    if (hub && g_atomic_int_dec_and_test(&hub->refs)) {
++        g_ptr_array_unref(hub->bindings);
++        g_mutex_clear(&hub->mutex);
++        g_free(hub);
++    }
++}
+--- /dev/null
++++ b/src/spice-latency-priv.h
+@@ -0,0 +1,8 @@
++/* Opt-in latency diagnostics. SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++#include <glib.h>
++typedef struct {
++    gint64 received_us, parsed_us, hardware_us, decoded_us, composed_us;
++    guint32 marker;
++    gboolean marker_valid;
++} SpiceDxLatencyFrame;
+--- /dev/null
++++ b/src/spice-glib-sym-file.def
+@@ -0,0 +1,172 @@
++EXPORTS
++spice_audio_get
++spice_audio_get_type
++spice_audio_new
++spice_channel_connect
++spice_channel_destroy
++spice_channel_disconnect
++spice_channel_event_get_type
++spice_channel_flush_async
++spice_channel_flush_finish
++spice_channel_get_error
++spice_channel_get_type
++spice_channel_new
++spice_channel_open_fd
++spice_channel_set_capability
++spice_channel_string_to_type
++spice_channel_test_capability
++spice_channel_test_common_capability
++spice_channel_type_to_string
++spice_client_error_quark
++spice_cursor_channel_get_type
++spice_cursor_shape_get_type
++spice_display_change_preferred_compression
++spice_display_change_preferred_video_codec_type
++spice_display_channel_change_preferred_compression
++spice_display_channel_change_preferred_video_codec_type
++spice_display_channel_change_preferred_video_codec_types
++spice_display_channel_get_gl_scanout
++spice_display_channel_get_primary
++spice_display_channel_get_type
++spice_display_channel_gl_draw_done
++spice_display_get_gl_scanout
++spice_display_get_primary
++spice_display_gl_draw_done
++spice_file_transfer_task_cancel
++spice_file_transfer_task_get_filename
++spice_file_transfer_task_get_progress
++spice_file_transfer_task_get_total_bytes
++spice_file_transfer_task_get_transferred_bytes
++spice_file_transfer_task_get_type
++spice_get_option_group
++spice_gl_scanout_free
++spice_gl_scanout_get_type
++spice_g_signal_connect_object
++spice_inputs_button_press
++spice_inputs_button_release
++spice_inputs_channel_button_press
++spice_inputs_channel_button_release
++spice_inputs_channel_get_type
++spice_inputs_channel_key_press
++spice_inputs_channel_key_press_and_release
++spice_inputs_channel_key_release
++spice_inputs_channel_motion
++spice_inputs_channel_position
++spice_inputs_channel_set_key_locks
++spice_inputs_key_press
++spice_inputs_key_press_and_release
++spice_inputs_key_release
++spice_inputs_lock_get_type
++spice_inputs_motion
++spice_inputs_position
++spice_inputs_set_key_locks
++spice_main_agent_test_capability
++spice_main_channel_agent_test_capability
++spice_main_channel_clipboard_selection_grab
++spice_main_channel_clipboard_selection_notify
++spice_main_channel_clipboard_selection_release
++spice_main_channel_clipboard_selection_request
++spice_main_channel_file_copy_async
++spice_main_channel_file_copy_finish
++spice_main_channel_get_type
++spice_main_channel_request_mouse_mode
++spice_main_channel_send_monitor_config
++spice_main_channel_update_display
++spice_main_channel_update_display_enabled
++spice_main_channel_update_display_mm
++spice_main_clipboard_grab
++spice_main_clipboard_notify
++spice_main_clipboard_release
++spice_main_clipboard_request
++spice_main_clipboard_selection_grab
++spice_main_clipboard_selection_notify
++spice_main_clipboard_selection_release
++spice_main_clipboard_selection_request
++spice_main_file_copy_async
++spice_main_file_copy_finish
++spice_main_request_mouse_mode
++spice_main_send_monitor_config
++spice_main_set_display
++spice_main_set_display_enabled
++spice_main_update_display
++spice_main_update_display_enabled
++spice_playback_channel_get_type
++spice_playback_channel_set_delay
++spice_port_channel_event
++spice_port_channel_get_type
++spice_port_channel_write_async
++spice_port_channel_write_finish
++spice_port_event
++spice_port_write_async
++spice_port_write_finish
++spice_qmp_port_get
++spice_qmp_port_get_type
++spice_qmp_port_query_status_async
++spice_qmp_port_query_status_finish
++spice_qmp_port_vm_action_async
++spice_qmp_port_vm_action_finish
++spice_qmp_status_get_type
++spice_qmp_status_ref
++spice_qmp_status_unref
++spice_record_channel_get_type
++spice_record_channel_send_data
++spice_record_send_data
++spice_session_connect
++spice_session_disconnect
++spice_session_get_channels
++spice_session_get_proxy_uri
++spice_session_get_read_only
++spice_session_get_type
++spice_session_has_channel_type
++spice_session_is_for_migration
++spice_session_migration_get_type
++spice_session_new
++spice_session_open_fd
++spice_session_verify_get_type
++spice_set_session_option
++spice_smartcard_channel_get_type
++spice_smartcard_manager_get
++spice_smartcard_manager_get_readers
++spice_smartcard_manager_get_type
++spice_smartcard_manager_insert_card
++spice_smartcard_manager_remove_card
++spice_smartcard_reader_get_type
++spice_smartcard_reader_insert_card
++spice_smartcard_reader_is_software
++spice_smartcard_reader_remove_card
++spice_uri_get_hostname
++spice_uri_get_password
++spice_uri_get_port
++spice_uri_get_scheme
++spice_uri_get_type
++spice_uri_get_user
++spice_uri_set_hostname
++spice_uri_set_password
++spice_uri_set_port
++spice_uri_set_scheme
++spice_uri_set_user
++spice_uri_to_string
++spice_usb_device_get_description
++spice_usb_device_get_libusb_device
++spice_usb_device_get_type
++spice_usb_device_manager_can_redirect_device
++spice_usb_device_manager_connect_device_async
++spice_usb_device_manager_connect_device_finish
++spice_usb_device_manager_create_shared_cd_device
++spice_usb_device_manager_disconnect_device
++spice_usb_device_manager_disconnect_device_async
++spice_usb_device_manager_disconnect_device_finish
++spice_usb_device_manager_get
++spice_usb_device_manager_get_devices
++spice_usb_device_manager_get_devices_with_filter
++spice_usb_device_manager_get_type
++spice_usb_device_manager_is_device_connected
++spice_usb_device_manager_is_device_shared_cd
++spice_usb_device_manager_is_redirecting
++spice_usb_device_manager_allocate_device_for_file_descriptor
++spice_usbredir_channel_get_type
++spice_util_get_debug
++spice_util_get_version_string
++spice_util_set_debug
++spice_uuid_to_string
++spice_webdav_channel_get_type
+--- /dev/null
++++ b/src/spice-gtk-sym-file.def
+@@ -0,0 +1,23 @@
++EXPORTS
++spice_display_get_grab_keys
++spice_display_get_pixbuf
++spice_display_get_type
++spice_display_key_event_get_type
++spice_display_keyboard_ungrab
++spice_display_mouse_ungrab
++spice_display_new
++spice_display_new_with_monitor
++spice_display_send_keys
++spice_display_set_grab_keys
++spice_grab_sequence_as_string
++spice_grab_sequence_copy
++spice_grab_sequence_free
++spice_grab_sequence_get_type
++spice_grab_sequence_new
++spice_grab_sequence_new_from_string
++spice_gtk_session_copy_to_guest
++spice_gtk_session_get
++spice_gtk_session_get_type
++spice_gtk_session_paste_from_guest
++spice_usb_device_widget_get_type
++spice_usb_device_widget_new

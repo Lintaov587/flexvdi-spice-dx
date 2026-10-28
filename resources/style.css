@@ -191,3 +191,22 @@ tooltip {
     border-color: rgba(50,50,50,0.8);
     font-size: 120%;
 }
+
+#connection-home { background-color: #ffffff; }
+#connection-home * { font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; font-size: 14px; }
+#connection-home .history-heading { font-size: 28px; font-weight: bold; color: #152b3c; }
+#connection-home .history-section { font-size: 18px; font-weight: bold; color: #24394a; }
+#connection-home .history-muted { font-size: 12px; color: #718094; }
+#connection-home entry { padding: 10px 12px; border-radius: 7px; }
+#connection-home button { border-radius: 7px; padding: 9px 16px; }
+#connection-home .history-card { background-color: #f6f8fb; border: 1px solid #dce4ed; border-radius: 10px; padding: 8px; }
+#connection-home button.history-connect { background-color: transparent; border: 1px solid transparent; padding: 4px; }
+#connection-home button.history-connect:hover { background-color: #e9f3f8; border-color: #8ac8dc; }
+#connection-home button.history-connect:focus { border-color: #00a1c1; }
+#connection-home button.history-connect label { color: #263c50; }
+#connection-home button.history-connect .history-name { font-size: 16px; font-weight: bold; }
+#connection-home button.history-connect .history-muted { color: #718094; }
+#connection-home button.history-remove { background-color: transparent; border-color: transparent; padding: 5px 8px; }
+#connection-home button.history-remove label { color: #718094; font-size: 12px; }
+#connection-home button.history-remove:hover { background-color: #edf0f4; }
+#connection-home flowboxchild { padding: 0; }

@@ -23,6 +23,7 @@
 #include <gtk/gtk.h>
 #include "client-app.h"
 #include "configuration.h"
+#include "connection-history.h"
 
 
 /*
@@ -34,7 +35,7 @@
 #define CLIENT_APP_WINDOW_TYPE (client_app_window_get_type ())
 G_DECLARE_FINAL_TYPE(ClientAppWindow, client_app_window, CLIENT, APP_WINDOW, GtkApplicationWindow)
 
-enum {
+typedef enum {
     SETTINGS_BUTTON = 0,
     ABOUT_BUTTON,
     SAVE_BUTTON,
@@ -145,6 +146,8 @@ gchar * client_app_window_get_desktop(ClientAppWindow * win);
  * Hide the configuration button.
  */
 void client_app_window_hide_config_button(ClientAppWindow * win);
+void client_app_window_show_history(ClientAppWindow *win, ClientHistoryConnect connect,
+                                    gpointer user_data, gboolean dx, gboolean fullscreen);
 
 
 #endif /* _CLIENT_WIN_H */

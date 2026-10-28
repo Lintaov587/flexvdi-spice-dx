@@ -1,0 +1,1 @@
+SUBSYSTEM=="virtio-ports", ATTR{name}=="org.spice-space.displays.0", GROUP="video", MODE="0660"

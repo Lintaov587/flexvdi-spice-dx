@@ -1,0 +1,11 @@
+--- a/libsoup/soup-socket.c
++++ b/libsoup/soup-socket.c
+@@ -1322,7 +1322,7 @@
+ 		fd = g_socket_get_fd (priv->gsock);
+ 		v6_only = TRUE;
+ 		setsockopt (fd, IPPROTO_IPV6, IPV6_V6ONLY,
+-			    &v6_only, sizeof (v6_only));
++			    (void *)&v6_only, sizeof (v6_only));
+ 	}
+ #endif
+ 

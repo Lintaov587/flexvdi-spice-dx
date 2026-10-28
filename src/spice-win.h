@@ -24,10 +24,12 @@
 #include <spice-client-gtk.h>
 #include "client-conn.h"
 #include "configuration.h"
+#include "display-layout.h"
 
 
 #define SPICE_WIN_TYPE (spice_window_get_type())
 G_DECLARE_FINAL_TYPE(SpiceWindow, spice_window, SPICE, WIN, GtkApplicationWindow)
+void spice_window_start_windowed(SpiceWindow *win);
 
 SpiceWindow * spice_window_new(ClientConn * conn, SpiceChannel * channel,
                                ClientConf * conf, int id, gchar * title);
@@ -36,5 +38,8 @@ void spice_win_show_notification(SpiceWindow * win, const gchar * text, gint dur
 void spice_win_release_mouse_pointer(SpiceWindow * win);
 int spice_window_get_monitor(SpiceWindow * win);
 void spice_window_enable_grabbing(SpiceWindow * win, gboolean enable);
+void spice_window_save_history(SpiceWindow *win);
+void spice_window_set_remote_monitor(SpiceWindow *win, const RemoteMonitor *monitor);
+void spice_window_add_displays_button(SpiceWindow *win, DisplayLayout *layout);
 
 #endif /* _SPICE_WIN_H */

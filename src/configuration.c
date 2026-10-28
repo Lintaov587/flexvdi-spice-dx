@@ -435,7 +435,7 @@ void client_conf_set_display_options(ClientConf * conf, GObject * display, gbool
     g_object_set(display,
         "grab-keyboard", TRUE && grab_enable,
         "grab-mouse", conf->grab_mouse && grab_enable,
-        "resize-guest", conf->resize_guest,
+        "resize-guest", conf->resize_guest && g_strcmp0(g_getenv("SPICE_DX_H264"), "1") != 0,
         "scaling", TRUE,
         "disable-inputs", FALSE,
         NULL);
